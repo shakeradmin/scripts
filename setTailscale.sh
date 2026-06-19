@@ -60,17 +60,19 @@ ensure_ubuntu_repos() {
   local codename
   codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"
 
-  if apt-cache show openssh-server >/dev/null 2>&1; then
+  if grep -qE "^deb .*(archive|security)\.ubuntu\.com" /etc/apt/sources.list 2>/dev/null; then
     return
   fi
 
   log "Standard Ubuntu repos missing — adding main,universe for $codename"
-  cat > /etc/apt/sources.list <<EOF
+  cat >> /etc/apt/sources.list <<EOF
+
+# Added by setTailscale.sh
 deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
 EOF
-  apt-get update -qq
+  apt-get update
 }
 
 reinstall_openssh_server() {
