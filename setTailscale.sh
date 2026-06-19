@@ -56,6 +56,23 @@ apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
+ensure_ubuntu_repos() {
+  local codename
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"
+
+  if apt-cache show openssh-server >/dev/null 2>&1; then
+    return
+  fi
+
+  log "Standard Ubuntu repos missing — adding main,universe for $codename"
+  cat > /etc/apt/sources.list <<EOF
+deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
+EOF
+  apt-get update -qq
+}
+
 reinstall_openssh_server() {
   log "Reinstalling openssh-server from scratch"
   apt-get update
@@ -227,6 +244,7 @@ main() {
   load_env
   require_root
   require_tailscale_login_mode
+  ensure_ubuntu_repos
   log "Updating package lists"
   apt-get update -qq
   install_openssh_server
