@@ -61,10 +61,11 @@ ensure_ubuntu_repos() {
   codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"
 
   if grep -qE "^deb .*(archive|security)\.ubuntu\.com" /etc/apt/sources.list 2>/dev/null; then
+    log "Standard Ubuntu repos already present"
     return
   fi
 
-  log "Standard Ubuntu repos missing — adding main,universe for $codename"
+  log "Standard Ubuntu repos missing — adding for $codename"
   cat >> /etc/apt/sources.list <<EOF
 
 # Added by setTailscale.sh
@@ -72,12 +73,15 @@ deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiv
 deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
 EOF
+}
+
+update_apt() {
+  log "Updating package lists"
   apt-get update
 }
 
 reinstall_openssh_server() {
   log "Reinstalling openssh-server from scratch"
-  apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server openssh-sftp-server || true
   apt_install openssh-server
 }
@@ -94,7 +98,6 @@ install_openssh_server() {
   fi
 
   log "Installing openssh-server"
-  apt-get update
   apt_install openssh-server
 }
 
@@ -174,7 +177,6 @@ install_tailscale() {
   os_codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"
 
   log "Installing Tailscale"
-  apt-get update
   apt_install curl ca-certificates gnupg
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${os_codename}.noarmor.gpg" >/usr/share/keyrings/tailscale-archive-keyring.gpg
@@ -247,8 +249,7 @@ main() {
   require_root
   require_tailscale_login_mode
   ensure_ubuntu_repos
-  log "Updating package lists"
-  apt-get update -qq
+  update_apt
   install_openssh_server
   rotate_ssh_host_keys
   configure_sshd
