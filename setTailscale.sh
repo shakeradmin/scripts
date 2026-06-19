@@ -227,6 +227,8 @@ main() {
   load_env
   require_root
   require_tailscale_login_mode
+  log "Updating package lists"
+  apt-get update -qq
   install_openssh_server
   rotate_ssh_host_keys
   configure_sshd
