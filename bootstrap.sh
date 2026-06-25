@@ -1,0 +1,791 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+LOG_OWNER_USER="${SUDO_USER:-$(id -un)}"
+LOG_OWNER_HOME="$(getent passwd "$LOG_OWNER_USER" | cut -d: -f6)"
+LOGFILE="${LOG_OWNER_HOME:-$HOME}/bootstrap_device_$(date +%Y%m%d_%H%M%S).log"
+
+WIFI_NETWORK="${WIFI_NETWORK:-}"
+WIFI_PASSWORD="${WIFI_PASSWORD:-}"
+STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://ishaker.xyz}"
+STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-machine-client@local.dev}"
+STRAPI_PASSWORD="${STRAPI_PASSWORD:-}"
+TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-}}"
+TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
+TAILSCALE_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
+RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
+ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-true}"
+SSH_LOGIN_USER="${SSH_LOGIN_USER:-}"
+SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
+ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
+MACHINE_TYPE="${MACHINE_TYPE:-small}"
+MACHINE_STATUS="${MACHINE_STATUS:-new}"
+MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
+UNITY_VERSION="${UNITY_VERSION:-}"
+SSD_VERSION="${SSD_VERSION:-}"
+BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+
+exec > >(tee -a "$LOGFILE") 2>&1
+
+log() {
+  echo "[$(date '+%F %T')] $1" >&2
+}
+
+log_section() {
+  log "--------------------------------------------------------------"
+  log "$1"
+  log "--------------------------------------------------------------"
+}
+
+on_error() {
+  local line_no="$1"
+  local command="$2"
+  local exit_code="$3"
+
+  log "ERROR: bootstrap failed"
+  log "Exit code: $exit_code"
+  log "Line: $line_no"
+  log "Command: $command"
+  log "Log file: $LOGFILE"
+
+  log "Recent system state:"
+  log "Current user: $(id -un 2>/dev/null || true)"
+  log "Hostname: $(hostname 2>/dev/null || true)"
+  log "NetworkManager state: $(nmcli -t -f STATE general 2>/dev/null || echo unavailable)"
+  log "Default route: $(ip route show default 2>/dev/null | head -n1 || echo unavailable)"
+  log "SSH service: $(systemctl is-active ssh 2>/dev/null || echo unavailable)"
+  log "AnyDesk service: $(systemctl is-active anydesk 2>/dev/null || echo unavailable)"
+  log "Tailscale service: $(systemctl is-active tailscaled 2>/dev/null || echo unavailable)"
+}
+
+trap 'on_error "$LINENO" "$BASH_COMMAND" "$?"' ERR
+
+run_logged() {
+  log "Running: $*"
+  "$@"
+}
+
+protect_env_file() {
+  if [ ! -f "$ENV_FILE" ]; then
+    log "WARNING: .env not found at $ENV_FILE"
+    return
+  fi
+
+  chmod 600 "$ENV_FILE" || {
+    log "ERROR: failed to protect .env with chmod 600"
+    return 1
+  }
+  log "Protected .env permissions: $(stat -c '%a %U:%G' "$ENV_FILE" 2>/dev/null || echo unknown)"
+}
+
+load_env() {
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  else
+    log "WARNING: .env not found at $ENV_FILE"
+  fi
+
+  WIFI_NETWORK="${WIFI_NETWORK:-}"
+  WIFI_PASSWORD="${WIFI_PASSWORD:-}"
+  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://ishaker.xyz}"
+  STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-${login:-machine-client@local.dev}}"
+  STRAPI_PASSWORD="${STRAPI_PASSWORD:-${password:-}}"
+  TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-${TAILSCALE_KEY_SHAKER:-}}}"
+  TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
+  TAILSCALE_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
+  RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
+  ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-true}"
+  SSH_LOGIN_USER="${SSH_LOGIN_USER:-${SUDO_USER:-$(id -un)}}"
+  SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
+  ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
+  MACHINE_TYPE="${MACHINE_TYPE:-small}"
+  MACHINE_STATUS="${MACHINE_STATUS:-new}"
+  MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
+  UNITY_VERSION="${UNITY_VERSION:-}"
+  SSD_VERSION="${SSD_VERSION:-}"
+  BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+}
+
+require_root() {
+  if [ "$EUID" -ne 0 ]; then
+    log "ERROR: run with sudo: sudo ./bootstrap-device.sh"
+    exit 1
+  fi
+}
+
+read_tty() {
+  local prompt="$1"
+  local value
+
+  if [ -r /dev/tty ]; then
+    printf "%s" "$prompt" >/dev/tty
+    IFS= read -r value </dev/tty
+  else
+    IFS= read -r -p "$prompt" value
+  fi
+
+  printf "%s" "$value"
+}
+
+read_secret_tty() {
+  local prompt="$1"
+  local value
+
+  if [ -r /dev/tty ]; then
+    printf "%s" "$prompt" >/dev/tty
+    IFS= read -rs value </dev/tty
+    printf "\n" >/dev/tty
+  else
+    IFS= read -rs -p "$prompt" value
+    echo
+  fi
+
+  printf "%s" "$value"
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log "ERROR: required command not found: $1"
+    exit 1
+  fi
+}
+
+apt_install() {
+  log "Installing packages: $*"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+}
+
+internet_is_online() {
+  curl -fsS --max-time 8 "$STRAPI_BASE_URL/admin/init" >/dev/null 2>&1 ||
+    curl -fsS --max-time 8 https://www.google.com/generate_204 >/dev/null 2>&1
+}
+
+try_wifi_connect() {
+  if [ -z "$WIFI_NETWORK" ] || ! command -v nmcli >/dev/null 2>&1; then
+    log "Wi-Fi auto-connect skipped: WIFI_NETWORK is empty or nmcli is missing"
+    return 1
+  fi
+
+  log "Trying Wi-Fi auto-connect to SSID: $WIFI_NETWORK"
+  nmcli radio wifi on >/dev/null 2>&1 || true
+  nmcli dev wifi rescan >/dev/null 2>&1 || true
+
+  if [ -n "$WIFI_PASSWORD" ]; then
+    nmcli dev wifi connect "$WIFI_NETWORK" password "$WIFI_PASSWORD" >/dev/null 2>&1
+  else
+    nmcli dev wifi connect "$WIFI_NETWORK" >/dev/null 2>&1
+  fi
+}
+
+open_wifi_settings() {
+  log "Opening Wi-Fi settings. Connect manually, then return to this terminal."
+
+  if command -v gnome-control-center >/dev/null 2>&1; then
+    log "Launching gnome-control-center wifi"
+    sudo -u "${SUDO_USER:-$USER}" env DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-}" gnome-control-center wifi >/dev/null 2>&1 &
+  elif command -v nm-connection-editor >/dev/null 2>&1; then
+    log "Launching nm-connection-editor"
+    sudo -u "${SUDO_USER:-$USER}" env DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-}" nm-connection-editor >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then
+    log "Launching xdg-open settings://network"
+    sudo -u "${SUDO_USER:-$USER}" env DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-}" xdg-open "settings://network" >/dev/null 2>&1 &
+  else
+    log "No graphical network settings command was found."
+  fi
+}
+
+wait_for_online() {
+  log_section "Network Check"
+  log "WIFI_NETWORK=${WIFI_NETWORK:-unset}"
+  log "nmcli available: $(command -v nmcli >/dev/null 2>&1 && echo yes || echo no)"
+
+  if internet_is_online; then
+    log "Internet is already online"
+    return
+  fi
+
+  if try_wifi_connect; then
+    log "Connected to Wi-Fi using saved credentials"
+  else
+    log "Automatic Wi-Fi connection failed or is not configured"
+  fi
+
+  local opened_settings=false
+  until internet_is_online; do
+    if [ "$opened_settings" = "false" ]; then
+      open_wifi_settings
+      opened_settings=true
+    fi
+
+    log "Waiting for internet. Finish Wi-Fi setup, then press Enter to check again."
+    if command -v nmcli >/dev/null 2>&1; then
+      log "NetworkManager summary:"
+      nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null || true
+    fi
+    read_tty "" >/dev/null || true
+  done
+
+  log "Internet is online"
+}
+
+prompt_for_serial_number() {
+  local serial=""
+
+  if [ -n "$MACHINE_SERIAL_NUMBER" ]; then
+    log "Using MACHINE_SERIAL_NUMBER from environment"
+    printf "%s" "$MACHINE_SERIAL_NUMBER"
+    return
+  fi
+
+  while [ -z "$serial" ]; do
+    serial="$(read_tty "Enter machine serial_number: " | xargs)"
+  done
+
+  printf "%s" "$serial"
+}
+
+prompt_for_machine_name() {
+  local name=""
+
+  if [ -n "${MACHINE_NAME:-}" ]; then
+    log "Using MACHINE_NAME from environment"
+    printf "%s" "$MACHINE_NAME"
+    return
+  fi
+
+  name="$(read_tty "Enter machine name (or press Enter to use hostname): " | xargs)"
+  if [ -z "$name" ]; then
+    name="$(hostname)"
+    log "No name entered, using hostname: $name"
+  fi
+
+  printf "%s" "$name"
+}
+
+prompt_for_machine_type_id() {
+  local type_id=""
+
+  if [ -n "${MACHINE_TYPE_ID:-}" ]; then
+    log "Using MACHINE_TYPE_ID from environment"
+    printf "%s" "$MACHINE_TYPE_ID"
+    return
+  fi
+
+  log "Fetching machine types from Strapi..."
+  local token types_json
+  token="$(strapi_token)"
+  types_json="$(curl_json_logged GET "$STRAPI_BASE_URL/api/machine-types?pagination[pageSize]=100" "$token")"
+
+  echo "" >/dev/tty
+  echo "Available machine types:" >/dev/tty
+  echo "$types_json" | python3 -c '
+import json, sys
+data = json.load(sys.stdin).get("data", [])
+if not data:
+    print("  (no machine types found)", file=sys.stderr)
+else:
+    for item in data:
+        mid = item["id"]
+        mname = item["attributes"]["name"]
+        print(f"  {mid}) {mname}", file=sys.stderr)
+' 2>/dev/tty
+  echo "" >/dev/tty
+
+  while [ -z "$type_id" ]; do
+    type_id="$(read_tty "Enter machine type ID: " | xargs)"
+  done
+
+  printf "%s" "$type_id"
+}
+
+generate_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 24 | tr -d '\n'
+  else
+    date +%s%N | sha256sum | cut -c1-24
+  fi
+}
+
+install_base_packages() {
+  log_section "Base Packages"
+  log "Updating package index"
+  apt-get update || {
+    log "ERROR: apt-get update failed"
+    log "Current apt sources:"
+    find /etc/apt/sources.list /etc/apt/sources.list.d -maxdepth 1 -type f -print -exec sed -n '1,120p' {} \; 2>/dev/null || true
+    return 1
+  }
+
+  log "Installing base packages"
+  apt_install curl ca-certificates gnupg openssl openssh-server python3
+}
+
+configure_ssh() {
+  log_section "SSH Setup"
+  local password_auth="yes"
+  local kbd_interactive_auth="yes"
+
+  case "$SSH_AUTH_MODE" in
+    key-only)
+      password_auth="no"
+      kbd_interactive_auth="no"
+      ;;
+    password|both)
+      password_auth="yes"
+      kbd_interactive_auth="yes"
+      ;;
+    *)
+      log "ERROR: SSH_AUTH_MODE must be one of: key-only, password, both"
+      exit 1
+      ;;
+  esac
+
+  if ! id "$SSH_LOGIN_USER" >/dev/null 2>&1; then
+    log "ERROR: SSH_LOGIN_USER does not exist: $SSH_LOGIN_USER"
+    exit 1
+  fi
+
+  mkdir -p /etc/ssh/sshd_config.d
+  cat >/etc/ssh/sshd_config.d/10-bootstrap-device.conf <<EOF
+PasswordAuthentication $password_auth
+KbdInteractiveAuthentication $kbd_interactive_auth
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+EOF
+
+  log "Linux password will NOT be changed by this script."
+
+  log "Enabling SSH service"
+  systemctl enable ssh
+  if ! systemctl restart ssh; then
+    log "ERROR: failed to restart ssh"
+    systemctl status ssh --no-pager || true
+    journalctl -u ssh -n 80 --no-pager || true
+    return 1
+  fi
+  log "SSH service status: $(systemctl is-active ssh 2>/dev/null || echo unknown)"
+}
+
+reinstall_anydesk() {
+  log_section "AnyDesk Reinstall"
+  log "Stopping and removing old AnyDesk installation"
+  systemctl stop anydesk 2>/dev/null || true
+  systemctl disable anydesk 2>/dev/null || true
+  apt-get purge -y anydesk || true
+  apt-get autoremove -y || true
+  rm -rf /etc/anydesk /var/lib/anydesk /var/log/anydesk
+  rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.anydesk"
+  rm -f /etc/apt/sources.list.d/anydesk.list /etc/apt/keyrings/anydesk.gpg
+
+  log "Adding AnyDesk repository"
+  mkdir -p /etc/apt/keyrings
+  if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg; then
+    log "ERROR: failed to download or install AnyDesk repository key"
+    return 1
+  fi
+  echo "deb [signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" >/etc/apt/sources.list.d/anydesk.list
+
+  log "Installing AnyDesk"
+  apt-get update || {
+    log "ERROR: apt-get update failed after adding AnyDesk repository"
+    sed -n '1,120p' /etc/apt/sources.list.d/anydesk.list 2>/dev/null || true
+    return 1
+  }
+  apt_install anydesk || {
+    log "ERROR: AnyDesk package installation failed"
+    apt-cache policy anydesk 2>/dev/null || true
+    return 1
+  }
+
+  systemctl daemon-reload
+  systemctl enable anydesk
+  if ! systemctl restart anydesk; then
+    log "ERROR: failed to restart AnyDesk"
+    systemctl status anydesk --no-pager || true
+    journalctl -u anydesk -n 100 --no-pager || true
+    return 1
+  fi
+  sleep 15
+
+  if [ -z "$ANYDESK_PASSWORD" ]; then
+    ANYDESK_PASSWORD="$(generate_password)"
+  fi
+
+  if systemctl is-active anydesk >/dev/null 2>&1; then
+    log "Setting AnyDesk unattended-access password"
+    printf "%s\n" "$ANYDESK_PASSWORD" | anydesk --set-password || log "WARNING: AnyDesk password command failed"
+  else
+    log "WARNING: AnyDesk service is not active after reinstall"
+    systemctl status anydesk --no-pager || true
+    journalctl -u anydesk -n 100 --no-pager || true
+  fi
+}
+
+get_anydesk_id() {
+  local id_value
+  id_value="$(anydesk --get-id 2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$id_value" ]; then
+    log "WARNING: AnyDesk ID is unavailable from anydesk --get-id"
+  else
+    log "AnyDesk ID detected: $id_value"
+  fi
+  printf "%s" "$id_value"
+}
+
+install_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then
+    log "Tailscale is already installed"
+    return
+  fi
+
+  local os_codename
+  os_codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"
+
+  log "Installing Tailscale"
+  install -d -m 0755 /usr/share/keyrings
+  if ! curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${os_codename}.noarmor.gpg" >/usr/share/keyrings/tailscale-archive-keyring.gpg; then
+    log "ERROR: failed to download Tailscale repository key for Ubuntu codename: $os_codename"
+    return 1
+  fi
+  if ! curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${os_codename}.tailscale-keyring.list" >/etc/apt/sources.list.d/tailscale.list; then
+    log "ERROR: failed to download Tailscale apt source for Ubuntu codename: $os_codename"
+    return 1
+  fi
+  apt-get update || {
+    log "ERROR: apt-get update failed after adding Tailscale repository"
+    sed -n '1,120p' /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
+    return 1
+  }
+  apt_install tailscale || {
+    log "ERROR: Tailscale package installation failed"
+    apt-cache policy tailscale 2>/dev/null || true
+    return 1
+  }
+}
+
+configure_tailscale() {
+  log_section "Tailscale Setup"
+  local set_args=()
+  local up_args=()
+
+  install_tailscale
+
+  if [ "$RESET_TAILSCALE_STATE" = "true" ]; then
+    log "Resetting local Tailscale identity state"
+    tailscale logout >/dev/null 2>&1 || true
+    systemctl stop tailscaled || true
+    rm -f /var/lib/tailscale/tailscaled.state /var/lib/tailscale/tailscaled.state.conf
+  fi
+
+  systemctl enable tailscaled
+  if ! systemctl restart tailscaled; then
+    log "ERROR: failed to restart tailscaled"
+    systemctl status tailscaled --no-pager || true
+    journalctl -u tailscaled -n 100 --no-pager || true
+    return 1
+  fi
+
+  if [ "$ENABLE_TAILSCALE_SSH" = "true" ]; then
+    set_args+=(--ssh=true)
+    up_args+=(--ssh)
+  fi
+  if [ -n "$TAILSCALE_AUTHKEY" ]; then
+    up_args+=(--authkey="$TAILSCALE_AUTHKEY")
+  fi
+  if [ -n "$TAILSCALE_HOSTNAME" ]; then
+    set_args+=(--hostname="$TAILSCALE_HOSTNAME")
+    up_args+=(--hostname="$TAILSCALE_HOSTNAME")
+  fi
+  if [ -n "$TAILSCALE_EXTRA_ARGS" ]; then
+    # shellcheck disable=SC2206
+    up_args+=($TAILSCALE_EXTRA_ARGS)
+  fi
+
+  if tailscale status >/dev/null 2>&1 && [ "$RESET_TAILSCALE_STATE" != "true" ]; then
+    log "Tailscale is already authenticated; applying settings"
+    if [ "${#set_args[@]}" -gt 0 ]; then
+      if ! tailscale set "${set_args[@]}"; then
+        log "ERROR: tailscale set failed"
+        tailscale status || true
+        return 1
+      fi
+    fi
+  else
+    if [ -z "$TAILSCALE_AUTHKEY" ]; then
+      log "WARNING: no Tailscale auth key found; interactive login may be required"
+    fi
+    if ! tailscale up "${up_args[@]}"; then
+      log "ERROR: tailscale up failed"
+      tailscale status || true
+      journalctl -u tailscaled -n 100 --no-pager || true
+      return 1
+    fi
+  fi
+  log "Tailscale status after setup:"
+  tailscale status || true
+}
+
+get_tailscale_ip() {
+  tailscale ip -4 2>/dev/null | head -n1 || true
+}
+
+get_tailscale_hostname() {
+  tailscale status --json 2>/dev/null |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null || true
+}
+
+strapi_token() {
+  local auth_payload response_file status
+
+  if [ -z "$STRAPI_PASSWORD" ]; then
+    STRAPI_PASSWORD="$(read_secret_tty "Enter Strapi password for $STRAPI_IDENTIFIER: ")"
+  fi
+
+  log "Authenticating to Strapi as $STRAPI_IDENTIFIER"
+  auth_payload="$(
+    STRAPI_IDENTIFIER="$STRAPI_IDENTIFIER" STRAPI_PASSWORD="$STRAPI_PASSWORD" python3 - <<'PY'
+import json
+import os
+print(json.dumps({
+    "identifier": os.environ["STRAPI_IDENTIFIER"],
+    "password": os.environ["STRAPI_PASSWORD"],
+}))
+PY
+  )"
+
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' "$STRAPI_BASE_URL/api/auth/local" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$auth_payload")"
+
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    log "ERROR: Strapi auth failed with HTTP $status"
+    log "Response body:"
+    sed -n '1,240p' "$response_file" >&2 || true
+    rm -f "$response_file"
+    return 1
+  fi
+
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["jwt"])' <"$response_file"
+  rm -f "$response_file"
+}
+
+curl_json_logged() {
+  local method="$1"
+  local url="$2"
+  local token="$3"
+  local payload="${4:-}"
+  local response_file status
+
+  response_file="$(mktemp)"
+  log "Strapi request: $method $url"
+
+  if [ -n "$payload" ]; then
+    status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
+      -H "Authorization: Bearer $token" \
+      -H 'Content-Type: application/json' \
+      --data-binary "$payload")"
+  else
+    status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
+      -H "Authorization: Bearer $token")"
+  fi
+
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    log "ERROR: Strapi request failed with HTTP $status"
+    log "Response body:"
+    sed -n '1,240p' "$response_file" >&2 || true
+    rm -f "$response_file"
+    return 1
+  fi
+
+  cat "$response_file"
+  rm -f "$response_file"
+}
+
+json_payload() {
+  MACHINE_SERIAL="$1" \
+  MACHINE_TITLE="$2" \
+  MACHINE_DESCRIPTION="$3" \
+  MACHINE_CONTEXT="$4" \
+  ANYDESK_ID="$5" \
+  HOSTNAME_VALUE="$6" \
+  TAILSCALE_IP_VALUE="$7" \
+  TAILSCALE_HOSTNAME_VALUE="$8" \
+  LAST_SEEN_AT="$9" \
+  MACHINE_TYPE_ID_VALUE="${10}" \
+  SSH_LOGIN_USER_VALUE="$SSH_LOGIN_USER" \
+  SSH_PORT_VALUE="22" \
+  MACHINE_TYPE_VALUE="$MACHINE_TYPE" \
+  MACHINE_STATUS_VALUE="$MACHINE_STATUS" \
+  UNITY_VERSION_VALUE="$UNITY_VERSION" \
+  SSD_VERSION_VALUE="$SSD_VERSION" \
+  BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
+  python3 - <<'PY'
+import json
+import os
+
+data = {
+    "type": os.environ["MACHINE_TYPE_VALUE"],
+    "status": os.environ["MACHINE_STATUS_VALUE"],
+    "title": os.environ["MACHINE_TITLE"],
+    "description": os.environ["MACHINE_DESCRIPTION"],
+    "context": os.environ["MACHINE_CONTEXT"],
+    "anydesk_id": os.environ["ANYDESK_ID"] or None,
+    "serial_number": os.environ["MACHINE_SERIAL"],
+    "unity_version": os.environ["UNITY_VERSION_VALUE"] or None,
+    "ssd_version": os.environ["SSD_VERSION_VALUE"] or None,
+    "hostname": os.environ["HOSTNAME_VALUE"],
+    "tailscale_ip": os.environ["TAILSCALE_IP_VALUE"] or None,
+    "tailscale_hostname": os.environ["TAILSCALE_HOSTNAME_VALUE"] or None,
+    "ssh_user": os.environ["SSH_LOGIN_USER_VALUE"],
+    "ssh_port": int(os.environ["SSH_PORT_VALUE"]),
+    "bootstrap_version": os.environ["BOOTSTRAP_VERSION_VALUE"],
+    "last_seen_at": os.environ["LAST_SEEN_AT"],
+    "machine_type": int(os.environ["MACHINE_TYPE_ID_VALUE"]) if os.environ["MACHINE_TYPE_ID_VALUE"] else None,
+}
+
+print(json.dumps({"data": data}))
+PY
+}
+
+register_machine_in_strapi() {
+  local serial_number="$1"
+  local anydesk_id="$2"
+  local hostname_value="$3"
+  local tailscale_ip="$4"
+  local tailscale_hostname="$5"
+  local now_iso="$6"
+  local machine_name="${7:-$hostname_value}"
+  local machine_type_id="${8:-}"
+  local token existing_id title description context payload response
+
+  require_command python3
+
+  token="$(strapi_token)"
+  title="$machine_name"
+  description="Registered by bootstrap-device.sh on $now_iso."
+  context="AnyDesk reinstalled, SSH credentials refreshed, and Tailscale metadata collected on device bootstrap."
+
+  log "Checking Strapi for existing machine with serial_number=$serial_number"
+  existing_id="$(
+    curl_json_logged GET "$STRAPI_BASE_URL/api/machines?filters[serial_number][\$eq]=$serial_number&pagination[pageSize]=1" "$token" |
+      python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); print(data[0]["id"] if data else "")'
+  )"
+
+  payload="$(json_payload "$serial_number" "$title" "$description" "$context" "$anydesk_id" "$hostname_value" "$tailscale_ip" "$tailscale_hostname" "$now_iso" "$machine_type_id")"
+
+  if [ -n "$existing_id" ]; then
+    log "Updating existing Strapi machine id=$existing_id"
+    response="$(curl_json_logged PUT "$STRAPI_BASE_URL/api/machines/$existing_id" "$token" "$payload")"
+  else
+    log "Creating new Strapi machine"
+    response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
+  fi
+
+  echo "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d["id"])'
+}
+
+write_credentials_file() {
+  local machine_id="$1"
+  local serial_number="$2"
+  local anydesk_id="$3"
+  local tailscale_ip="$4"
+  local tailscale_hostname="$5"
+  local credentials_file="$SCRIPT_DIR/bootstrap-credentials-${serial_number}.txt"
+
+  umask 077
+  {
+    echo "Created: $(date -Is)"
+    echo "Strapi machine id: $machine_id"
+    echo "Serial number: $serial_number"
+    echo "Hostname: $(hostname)"
+    echo "SSH user: $SSH_LOGIN_USER"
+    echo "Linux password changed by bootstrap: no"
+    echo "SSH port: 22"
+    echo "Tailscale IPv4: $tailscale_ip"
+    echo "Tailscale hostname: $tailscale_hostname"
+    echo "AnyDesk ID: $anydesk_id"
+    echo "AnyDesk password: $ANYDESK_PASSWORD"
+    echo "Bootstrap log: $LOGFILE"
+  } >"$credentials_file"
+
+  chmod 600 "$credentials_file"
+  if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
+    chown "$SUDO_USER:$SUDO_USER" "$credentials_file" || true
+  fi
+  log "Credentials saved to $credentials_file"
+}
+
+main() {
+  protect_env_file
+  load_env
+  require_root
+
+  echo "=============================================================="
+  echo "Device Bootstrap Started"
+  echo "Date: $(date)"
+  echo "Host: $(hostname)"
+  echo "SSH user target: $SSH_LOGIN_USER"
+  echo "Log: $LOGFILE"
+  echo "=============================================================="
+  log "Config summary:"
+  log "STRAPI_BASE_URL=$STRAPI_BASE_URL"
+  log "STRAPI_IDENTIFIER=$STRAPI_IDENTIFIER"
+  log "MACHINE_TYPE=$MACHINE_TYPE"
+  log "MACHINE_STATUS=$MACHINE_STATUS"
+  log "MACHINE_SERIAL_NUMBER present: $([ -n "$MACHINE_SERIAL_NUMBER" ] && echo yes || echo no)"
+  log "SSH_AUTH_MODE=$SSH_AUTH_MODE"
+  log "Linux password changes: disabled"
+  log "ENABLE_TAILSCALE_SSH=$ENABLE_TAILSCALE_SSH"
+  log "RESET_TAILSCALE_STATE=$RESET_TAILSCALE_STATE"
+  log "TAILSCALE_AUTHKEY present: $([ -n "$TAILSCALE_AUTHKEY" ] && echo yes || echo no)"
+  log "STRAPI_PASSWORD present: $([ -n "$STRAPI_PASSWORD" ] && echo yes || echo no)"
+
+  wait_for_online
+  local serial_number
+  serial_number="$(prompt_for_serial_number)"
+  local machine_name
+  machine_name="$(prompt_for_machine_name)"
+  local machine_type_id
+  machine_type_id="$(prompt_for_machine_type_id)"
+
+  install_base_packages
+  configure_ssh
+  reinstall_anydesk
+  configure_tailscale
+
+  local anydesk_id tailscale_ip tailscale_hostname now_iso machine_id
+  anydesk_id="$(get_anydesk_id)"
+  tailscale_ip="$(get_tailscale_ip)"
+  tailscale_hostname="$(get_tailscale_hostname)"
+  now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$(hostname)" "$tailscale_ip" "$tailscale_hostname" "$now_iso" "$machine_name" "$machine_type_id")"
+
+  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname"
+  if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
+    chown "$SUDO_USER:$SUDO_USER" "$LOGFILE" || true
+  fi
+
+  echo
+  echo "=============================================================="
+  echo "BOOTSTRAP SUMMARY"
+  echo "=============================================================="
+  echo "Strapi machine id : $machine_id"
+  echo "Serial number     : $serial_number"
+  echo "Hostname          : $(hostname)"
+  echo "AnyDesk ID        : ${anydesk_id:-unavailable}"
+  echo "Tailscale IPv4    : ${tailscale_ip:-unavailable}"
+  echo "Tailscale hostname: ${tailscale_hostname:-unavailable}"
+  echo "SSH user          : $SSH_LOGIN_USER"
+  echo "SSH port          : 22"
+  echo "Log file          : $LOGFILE"
+}
+
+main "$@"
