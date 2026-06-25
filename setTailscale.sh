@@ -53,22 +53,26 @@ require_tailscale_login_mode() {
 }
 
 wait_for_apt_lock() {
-  local max_wait=120
+  local max_wait=30
   local waited=0
-  while fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend 2>/dev/null; do
+
+  while fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
     if [ "$waited" -eq 0 ]; then
-      log "Waiting for other apt/dpkg processes to finish..."
+      log "Waiting for other apt/dpkg processes to finish (up to ${max_wait}s)..."
     fi
     sleep 2
     waited=$((waited + 2))
     if [ "$waited" -ge "$max_wait" ]; then
-      log "Apt lock still held after ${max_wait}s — killing blocking processes"
+      log "Apt lock still held after ${max_wait}s — force-clearing"
+      systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+      systemctl kill apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
       for proc in apt-get apt aptd dpkg unattended-upgr; do
-        pkill -9 "$proc" 2>/dev/null || true
+        killall -9 "$proc" 2>/dev/null || true
       done
       sleep 2
       rm -f /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend
       dpkg --configure -a 2>/dev/null || true
+      log "Apt locks cleared"
       break
     fi
   done
