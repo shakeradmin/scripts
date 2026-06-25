@@ -52,7 +52,30 @@ require_tailscale_login_mode() {
   exit 1
 }
 
+wait_for_apt_lock() {
+  local max_wait=120
+  local waited=0
+  while fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend 2>/dev/null; do
+    if [ "$waited" -eq 0 ]; then
+      log "Waiting for other apt/dpkg processes to finish..."
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    if [ "$waited" -ge "$max_wait" ]; then
+      log "Apt lock still held after ${max_wait}s — killing blocking processes"
+      for proc in apt-get apt aptd dpkg unattended-upgr; do
+        pkill -9 "$proc" 2>/dev/null || true
+      done
+      sleep 2
+      rm -f /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend
+      dpkg --configure -a 2>/dev/null || true
+      break
+    fi
+  done
+}
+
 apt_install() {
+  wait_for_apt_lock
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
@@ -76,12 +99,14 @@ EOF
 }
 
 update_apt() {
+  wait_for_apt_lock
   log "Updating package lists"
   apt-get update
 }
 
 reinstall_openssh_server() {
   log "Reinstalling openssh-server from scratch"
+  wait_for_apt_lock
   DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server openssh-sftp-server || true
   apt_install openssh-server
 }
@@ -181,6 +206,7 @@ install_tailscale() {
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${os_codename}.noarmor.gpg" >/usr/share/keyrings/tailscale-archive-keyring.gpg
   curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${os_codename}.tailscale-keyring.list" >/etc/apt/sources.list.d/tailscale.list
+  wait_for_apt_lock
   apt-get update
   apt_install tailscale
 }
