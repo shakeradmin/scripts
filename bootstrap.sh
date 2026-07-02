@@ -29,6 +29,19 @@ UNITY_VERSION="${UNITY_VERSION:-}"
 SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
 
+STRAPI_PASSWORD_FILE="$(mktemp /tmp/.bootstrap_strapi_pw.XXXXXX)"
+chmod 600 "$STRAPI_PASSWORD_FILE"
+cleanup_strapi_password_file() {
+  rm -f "$STRAPI_PASSWORD_FILE"
+}
+trap cleanup_strapi_password_file EXIT
+
+SETUP_WARNINGS=()
+record_warning() {
+  SETUP_WARNINGS+=("$1")
+  log "WARNING: $1"
+}
+
 exec > >(tee -a "$LOGFILE") 2>&1
 
 log() {
@@ -311,7 +324,7 @@ set_anydesk_password() {
     delay=$((delay * 2))
   done
 
-  log "WARNING: AnyDesk password command failed after 5 attempts"
+  record_warning "AnyDesk password command failed after 5 attempts"
   return 1
 }
 
@@ -431,7 +444,7 @@ reinstall_anydesk() {
     log "Setting AnyDesk unattended-access password"
     set_anydesk_password "$ANYDESK_PASSWORD" || true
   else
-    log "WARNING: AnyDesk service is not active — cannot set password"
+    record_warning "AnyDesk service is not active — cannot set password"
     systemctl status anydesk --no-pager || true
     journalctl -u anydesk -n 100 --no-pager || true
   fi
@@ -547,8 +560,13 @@ get_tailscale_hostname() {
 strapi_token() {
   local auth_payload response_file status
 
+  if [ -z "$STRAPI_PASSWORD" ] && [ -s "$STRAPI_PASSWORD_FILE" ]; then
+    STRAPI_PASSWORD="$(cat "$STRAPI_PASSWORD_FILE")"
+  fi
+
   if [ -z "$STRAPI_PASSWORD" ]; then
     STRAPI_PASSWORD="$(read_secret_tty "Enter Strapi password for $STRAPI_IDENTIFIER: ")"
+    printf "%s" "$STRAPI_PASSWORD" >"$STRAPI_PASSWORD_FILE"
   fi
 
   log "Authenticating to Strapi as $STRAPI_IDENTIFIER"
@@ -760,7 +778,7 @@ main() {
   local machine_type_id
   machine_type_id="$(prompt_for_machine_type_id)"
 
-  load_creds_from_strapi || log "WARNING: could not load creds from Strapi cred entity — falling back to any locally-provided TAILSCALE_AUTHKEY/ANYDESK_PASSWORD"
+  load_creds_from_strapi || record_warning "could not load creds from Strapi cred entity — falling back to any locally-provided TAILSCALE_AUTHKEY/ANYDESK_PASSWORD"
 
   install_base_packages
   configure_ssh
@@ -769,7 +787,13 @@ main() {
 
   local anydesk_id tailscale_ip tailscale_hostname now_iso machine_id
   anydesk_id="$(get_anydesk_id)"
+  if [ -z "$anydesk_id" ]; then
+    record_warning "AnyDesk ID is unavailable from anydesk --get-id"
+  fi
   tailscale_ip="$(get_tailscale_ip)"
+  if [ -z "$tailscale_ip" ]; then
+    record_warning "Tailscale IPv4 address is unavailable — Tailscale may not be connected"
+  fi
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id")"
@@ -781,7 +805,11 @@ main() {
 
   echo
   echo "=============================================================="
-  echo "BOOTSTRAP SUMMARY"
+  if [ "${#SETUP_WARNINGS[@]}" -eq 0 ]; then
+    echo "BOOTSTRAP SUCCEEDED"
+  else
+    echo "BOOTSTRAP COMPLETED WITH ERRORS (${#SETUP_WARNINGS[@]})"
+  fi
   echo "=============================================================="
   echo "Strapi machine id : $machine_id"
   echo "Serial number     : $serial_number"
@@ -792,6 +820,16 @@ main() {
   echo "SSH user          : $SSH_LOGIN_USER"
   echo "SSH port          : 22"
   echo "Log file          : $LOGFILE"
+
+  if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
+    echo
+    echo "Errors encountered during setup:"
+    local w
+    for w in "${SETUP_WARNINGS[@]}"; do
+      echo "  - $w"
+    done
+    exit 2
+  fi
 }
 
 main "$@"
