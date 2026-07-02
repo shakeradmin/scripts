@@ -139,8 +139,20 @@ fi
 if [ "$SERVICE_STATUS" = "active" ]; then
 log "Setting unattended-access password..."
 
-echo "$PASSWORD" | sudo anydesk --set-password || \
-log "WARNING: Password command returned an error."
+PASSWORD_SET=0
+for attempt in 1 2 3 4 5; do
+  if echo "$PASSWORD" | sudo anydesk --set-password; then
+    log "Password set successfully (attempt $attempt)"
+    PASSWORD_SET=1
+    break
+  fi
+  log "Password attempt $attempt failed; AnyDesk's IPC can be briefly unready after a (re)start — retrying in 3s"
+  sleep 3
+done
+
+if [ "$PASSWORD_SET" -ne 1 ]; then
+  log "WARNING: Password command failed after 5 attempts."
+fi
 
 fi
 
