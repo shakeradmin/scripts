@@ -10,8 +10,8 @@ LOGFILE="${LOG_OWNER_HOME:-$HOME}/bootstrap_device_$(date +%Y%m%d_%H%M%S).log"
 
 WIFI_NETWORK="${WIFI_NETWORK:-}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-}"
-STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://ishaker.xyz}"
-STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-machine-client@local.dev}"
+STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishaker.xyz}"
+STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-registrator}"
 STRAPI_PASSWORD="${STRAPI_PASSWORD:-}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-}}"
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
@@ -93,8 +93,8 @@ load_env() {
 
   WIFI_NETWORK="${WIFI_NETWORK:-}"
   WIFI_PASSWORD="${WIFI_PASSWORD:-}"
-  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://ishaker.xyz}"
-  STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-${login:-machine-client@local.dev}}"
+  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishaker.xyz}"
+  STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-${login:-registrator}}"
   STRAPI_PASSWORD="${STRAPI_PASSWORD:-${password:-}}"
   TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-${TAILSCALE_KEY_SHAKER:-}}}"
   TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
@@ -250,24 +250,6 @@ prompt_for_serial_number() {
   printf "%s" "$serial"
 }
 
-prompt_for_machine_name() {
-  local name=""
-
-  if [ -n "${MACHINE_NAME:-}" ]; then
-    log "Using MACHINE_NAME from environment"
-    printf "%s" "$MACHINE_NAME"
-    return
-  fi
-
-  name="$(read_tty "Enter machine name (or press Enter to use hostname): " | xargs)"
-  if [ -z "$name" ]; then
-    name="$(hostname)"
-    log "No name entered, using hostname: $name"
-  fi
-
-  printf "%s" "$name"
-}
-
 prompt_for_machine_type_id() {
   local type_id=""
 
@@ -374,7 +356,13 @@ EOF
 }
 
 reinstall_anydesk() {
-  log_section "AnyDesk Reinstall"
+  log_section "AnyDesk Setup"
+
+  if command -v anydesk >/dev/null 2>&1 && systemctl is-active anydesk >/dev/null 2>&1; then
+    log "AnyDesk already installed and running — skipping reinstall"
+    return
+  fi
+
   log "Stopping and removing old AnyDesk installation"
   systemctl stop anydesk 2>/dev/null || true
   systemctl disable anydesk 2>/dev/null || true
@@ -472,10 +460,16 @@ install_tailscale() {
 
 configure_tailscale() {
   log_section "Tailscale Setup"
-  local set_args=()
-  local up_args=()
 
   install_tailscale
+
+  if [ "$RESET_TAILSCALE_STATE" != "true" ] && tailscale status >/dev/null 2>&1; then
+    log "Tailscale already installed and authenticated — skipping reconfiguration"
+    tailscale status || true
+    return
+  fi
+
+  local up_args=()
 
   if [ "$RESET_TAILSCALE_STATE" = "true" ]; then
     log "Resetting local Tailscale identity state"
@@ -493,14 +487,12 @@ configure_tailscale() {
   fi
 
   if [ "$ENABLE_TAILSCALE_SSH" = "true" ]; then
-    set_args+=(--ssh=true)
     up_args+=(--ssh)
   fi
   if [ -n "$TAILSCALE_AUTHKEY" ]; then
     up_args+=(--authkey="$TAILSCALE_AUTHKEY")
   fi
   if [ -n "$TAILSCALE_HOSTNAME" ]; then
-    set_args+=(--hostname="$TAILSCALE_HOSTNAME")
     up_args+=(--hostname="$TAILSCALE_HOSTNAME")
   fi
   if [ -n "$TAILSCALE_EXTRA_ARGS" ]; then
@@ -508,26 +500,16 @@ configure_tailscale() {
     up_args+=($TAILSCALE_EXTRA_ARGS)
   fi
 
-  if tailscale status >/dev/null 2>&1 && [ "$RESET_TAILSCALE_STATE" != "true" ]; then
-    log "Tailscale is already authenticated; applying settings"
-    if [ "${#set_args[@]}" -gt 0 ]; then
-      if ! tailscale set "${set_args[@]}"; then
-        log "ERROR: tailscale set failed"
-        tailscale status || true
-        return 1
-      fi
-    fi
-  else
-    if [ -z "$TAILSCALE_AUTHKEY" ]; then
-      log "WARNING: no Tailscale auth key found; interactive login may be required"
-    fi
-    if ! tailscale up "${up_args[@]}"; then
-      log "ERROR: tailscale up failed"
-      tailscale status || true
-      journalctl -u tailscaled -n 100 --no-pager || true
-      return 1
-    fi
+  if [ -z "$TAILSCALE_AUTHKEY" ]; then
+    log "WARNING: no Tailscale auth key found; interactive login may be required"
   fi
+  if ! tailscale up "${up_args[@]}"; then
+    log "ERROR: tailscale up failed"
+    tailscale status || true
+    journalctl -u tailscaled -n 100 --no-pager || true
+    return 1
+  fi
+
   log "Tailscale status after setup:"
   tailscale status || true
 }
@@ -611,43 +593,18 @@ curl_json_logged() {
 
 json_payload() {
   MACHINE_SERIAL="$1" \
-  MACHINE_TITLE="$2" \
-  MACHINE_DESCRIPTION="$3" \
-  MACHINE_CONTEXT="$4" \
-  ANYDESK_ID="$5" \
-  HOSTNAME_VALUE="$6" \
-  TAILSCALE_IP_VALUE="$7" \
-  TAILSCALE_HOSTNAME_VALUE="$8" \
-  LAST_SEEN_AT="$9" \
-  MACHINE_TYPE_ID_VALUE="${10}" \
-  SSH_LOGIN_USER_VALUE="$SSH_LOGIN_USER" \
-  SSH_PORT_VALUE="22" \
-  MACHINE_TYPE_VALUE="$MACHINE_TYPE" \
-  MACHINE_STATUS_VALUE="$MACHINE_STATUS" \
-  UNITY_VERSION_VALUE="$UNITY_VERSION" \
-  SSD_VERSION_VALUE="$SSD_VERSION" \
-  BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
+  ANYDESK_ID="$2" \
+  TAILSCALE_IP_VALUE="$3" \
+  MACHINE_TYPE_ID_VALUE="$4" \
   python3 - <<'PY'
 import json
 import os
 
 data = {
-    "type": os.environ["MACHINE_TYPE_VALUE"],
-    "status": os.environ["MACHINE_STATUS_VALUE"],
-    "title": os.environ["MACHINE_TITLE"],
-    "description": os.environ["MACHINE_DESCRIPTION"],
-    "context": os.environ["MACHINE_CONTEXT"],
+    "status": "new",
     "anydesk_id": os.environ["ANYDESK_ID"] or None,
     "serial_number": os.environ["MACHINE_SERIAL"],
-    "unity_version": os.environ["UNITY_VERSION_VALUE"] or None,
-    "ssd_version": os.environ["SSD_VERSION_VALUE"] or None,
-    "hostname": os.environ["HOSTNAME_VALUE"],
     "tailscale_ip": os.environ["TAILSCALE_IP_VALUE"] or None,
-    "tailscale_hostname": os.environ["TAILSCALE_HOSTNAME_VALUE"] or None,
-    "ssh_user": os.environ["SSH_LOGIN_USER_VALUE"],
-    "ssh_port": int(os.environ["SSH_PORT_VALUE"]),
-    "bootstrap_version": os.environ["BOOTSTRAP_VERSION_VALUE"],
-    "last_seen_at": os.environ["LAST_SEEN_AT"],
     "machine_type": int(os.environ["MACHINE_TYPE_ID_VALUE"]) if os.environ["MACHINE_TYPE_ID_VALUE"] else None,
 }
 
@@ -658,20 +615,13 @@ PY
 register_machine_in_strapi() {
   local serial_number="$1"
   local anydesk_id="$2"
-  local hostname_value="$3"
-  local tailscale_ip="$4"
-  local tailscale_hostname="$5"
-  local now_iso="$6"
-  local machine_name="${7:-$hostname_value}"
-  local machine_type_id="${8:-}"
-  local token existing_id title description context payload response
+  local tailscale_ip="$3"
+  local machine_type_id="$4"
+  local token existing_id payload response
 
   require_command python3
 
   token="$(strapi_token)"
-  title="$machine_name"
-  description="Registered by bootstrap-device.sh on $now_iso."
-  context="AnyDesk reinstalled, SSH credentials refreshed, and Tailscale metadata collected on device bootstrap."
 
   log "Checking Strapi for existing machine with serial_number=$serial_number"
   existing_id="$(
@@ -679,7 +629,7 @@ register_machine_in_strapi() {
       python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); print(data[0]["id"] if data else "")'
   )"
 
-  payload="$(json_payload "$serial_number" "$title" "$description" "$context" "$anydesk_id" "$hostname_value" "$tailscale_ip" "$tailscale_hostname" "$now_iso" "$machine_type_id")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id")"
 
   if [ -n "$existing_id" ]; then
     log "Updating existing Strapi machine id=$existing_id"
@@ -751,8 +701,6 @@ main() {
   wait_for_online
   local serial_number
   serial_number="$(prompt_for_serial_number)"
-  local machine_name
-  machine_name="$(prompt_for_machine_name)"
   local machine_type_id
   machine_type_id="$(prompt_for_machine_type_id)"
 
@@ -766,7 +714,7 @@ main() {
   tailscale_ip="$(get_tailscale_ip)"
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$(hostname)" "$tailscale_ip" "$tailscale_hostname" "$now_iso" "$machine_name" "$machine_type_id")"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id")"
 
   write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
