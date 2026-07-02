@@ -321,6 +321,9 @@ set_anydesk_password() {
       log "AnyDesk password set successfully (attempt $attempt)"
       return 0
     fi
+    if [ "$attempt" -eq 5 ]; then
+      break
+    fi
     log "AnyDesk password attempt $attempt failed (exit $rc); AnyDesk rate-limits rapid password changes — retrying in ${delay}s"
     sleep "$delay"
     delay=$((delay * 2))
