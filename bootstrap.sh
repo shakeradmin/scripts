@@ -10,7 +10,7 @@ LOGFILE="${LOG_OWNER_HOME:-$HOME}/bootstrap_device_$(date +%Y%m%d_%H%M%S).log"
 
 WIFI_NETWORK="${WIFI_NETWORK:-}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-}"
-STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishaker.xyz}"
+STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishakeradmin.com}"
 STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-registrator}"
 STRAPI_PASSWORD="${STRAPI_PASSWORD:-}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-}}"
@@ -93,7 +93,7 @@ load_env() {
 
   WIFI_NETWORK="${WIFI_NETWORK:-}"
   WIFI_PASSWORD="${WIFI_PASSWORD:-}"
-  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishaker.xyz}"
+  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishakeradmin.com}"
   STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-${login:-registrator}}"
   STRAPI_PASSWORD="${STRAPI_PASSWORD:-${password:-}}"
   TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-${TAILSCALE_KEY_SHAKER:-}}}"
@@ -360,57 +360,57 @@ reinstall_anydesk() {
 
   if command -v anydesk >/dev/null 2>&1 && systemctl is-active anydesk >/dev/null 2>&1; then
     log "AnyDesk already installed and running — skipping reinstall"
-    return
+  else
+    log "Stopping and removing old AnyDesk installation"
+    systemctl stop anydesk 2>/dev/null || true
+    systemctl disable anydesk 2>/dev/null || true
+    apt-get purge -y anydesk || true
+    apt-get autoremove -y || true
+    rm -rf /etc/anydesk /var/lib/anydesk /var/log/anydesk
+    rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.anydesk"
+    rm -f /etc/apt/sources.list.d/anydesk.list /etc/apt/keyrings/anydesk.gpg
+
+    log "Adding AnyDesk repository"
+    mkdir -p /etc/apt/keyrings
+    if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg; then
+      log "ERROR: failed to download or install AnyDesk repository key"
+      return 1
+    fi
+    echo "deb [signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" >/etc/apt/sources.list.d/anydesk.list
+
+    log "Installing AnyDesk"
+    apt-get update || {
+      log "ERROR: apt-get update failed after adding AnyDesk repository"
+      sed -n '1,120p' /etc/apt/sources.list.d/anydesk.list 2>/dev/null || true
+      return 1
+    }
+    apt_install anydesk || {
+      log "ERROR: AnyDesk package installation failed"
+      apt-cache policy anydesk 2>/dev/null || true
+      return 1
+    }
+
+    systemctl daemon-reload
+    systemctl enable anydesk
+    if ! systemctl restart anydesk; then
+      log "ERROR: failed to restart AnyDesk"
+      systemctl status anydesk --no-pager || true
+      journalctl -u anydesk -n 100 --no-pager || true
+      return 1
+    fi
+    sleep 15
   fi
-
-  log "Stopping and removing old AnyDesk installation"
-  systemctl stop anydesk 2>/dev/null || true
-  systemctl disable anydesk 2>/dev/null || true
-  apt-get purge -y anydesk || true
-  apt-get autoremove -y || true
-  rm -rf /etc/anydesk /var/lib/anydesk /var/log/anydesk
-  rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.anydesk"
-  rm -f /etc/apt/sources.list.d/anydesk.list /etc/apt/keyrings/anydesk.gpg
-
-  log "Adding AnyDesk repository"
-  mkdir -p /etc/apt/keyrings
-  if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg; then
-    log "ERROR: failed to download or install AnyDesk repository key"
-    return 1
-  fi
-  echo "deb [signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" >/etc/apt/sources.list.d/anydesk.list
-
-  log "Installing AnyDesk"
-  apt-get update || {
-    log "ERROR: apt-get update failed after adding AnyDesk repository"
-    sed -n '1,120p' /etc/apt/sources.list.d/anydesk.list 2>/dev/null || true
-    return 1
-  }
-  apt_install anydesk || {
-    log "ERROR: AnyDesk package installation failed"
-    apt-cache policy anydesk 2>/dev/null || true
-    return 1
-  }
-
-  systemctl daemon-reload
-  systemctl enable anydesk
-  if ! systemctl restart anydesk; then
-    log "ERROR: failed to restart AnyDesk"
-    systemctl status anydesk --no-pager || true
-    journalctl -u anydesk -n 100 --no-pager || true
-    return 1
-  fi
-  sleep 15
 
   if [ -z "$ANYDESK_PASSWORD" ]; then
     ANYDESK_PASSWORD="$(generate_password)"
+    log "No ANYDESK_PASSWORD available; generated a random one"
   fi
 
   if systemctl is-active anydesk >/dev/null 2>&1; then
     log "Setting AnyDesk unattended-access password"
     printf "%s\n" "$ANYDESK_PASSWORD" | anydesk --set-password || log "WARNING: AnyDesk password command failed"
   else
-    log "WARNING: AnyDesk service is not active after reinstall"
+    log "WARNING: AnyDesk service is not active — cannot set password"
     systemctl status anydesk --no-pager || true
     journalctl -u anydesk -n 100 --no-pager || true
   fi
@@ -478,6 +478,11 @@ configure_tailscale() {
     rm -f /var/lib/tailscale/tailscaled.state /var/lib/tailscale/tailscaled.state.conf
   fi
 
+  if [ -z "$TAILSCALE_AUTHKEY" ]; then
+    log "ERROR: no Tailscale auth key available — refusing interactive login"
+    return 1
+  fi
+
   systemctl enable tailscaled
   if ! systemctl restart tailscaled; then
     log "ERROR: failed to restart tailscaled"
@@ -489,9 +494,7 @@ configure_tailscale() {
   if [ "$ENABLE_TAILSCALE_SSH" = "true" ]; then
     up_args+=(--ssh)
   fi
-  if [ -n "$TAILSCALE_AUTHKEY" ]; then
-    up_args+=(--authkey="$TAILSCALE_AUTHKEY")
-  fi
+  up_args+=(--authkey="$TAILSCALE_AUTHKEY")
   if [ -n "$TAILSCALE_HOSTNAME" ]; then
     up_args+=(--hostname="$TAILSCALE_HOSTNAME")
   fi
@@ -500,9 +503,6 @@ configure_tailscale() {
     up_args+=($TAILSCALE_EXTRA_ARGS)
   fi
 
-  if [ -z "$TAILSCALE_AUTHKEY" ]; then
-    log "WARNING: no Tailscale auth key found; interactive login may be required"
-  fi
   if ! tailscale up "${up_args[@]}"; then
     log "ERROR: tailscale up failed"
     tailscale status || true
@@ -589,6 +589,30 @@ curl_json_logged() {
 
   cat "$response_file"
   rm -f "$response_file"
+}
+
+load_creds_from_strapi() {
+  local token creds_json ts_key anydesk_password
+
+  log "Fetching TS_KEY/ANYDESK_PASSWORD from Strapi cred entity"
+  token="$(strapi_token)"
+  creds_json="$(curl_json_logged GET "$STRAPI_BASE_URL/api/cred" "$token")" || {
+    log "ERROR: failed to fetch Strapi cred entity"
+    return 1
+  }
+
+  ts_key="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("TS_KEY") or "")')"
+  anydesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("ANYDESK_PASSWORD") or "")')"
+
+  if [ -z "$TAILSCALE_AUTHKEY" ] && [ -n "$ts_key" ]; then
+    TAILSCALE_AUTHKEY="$ts_key"
+    log "Loaded TAILSCALE_AUTHKEY from Strapi cred entity"
+  fi
+
+  if [ -z "$ANYDESK_PASSWORD" ] && [ -n "$anydesk_password" ]; then
+    ANYDESK_PASSWORD="$anydesk_password"
+    log "Loaded ANYDESK_PASSWORD from Strapi cred entity"
+  fi
 }
 
 json_payload() {
@@ -703,6 +727,8 @@ main() {
   serial_number="$(prompt_for_serial_number)"
   local machine_type_id
   machine_type_id="$(prompt_for_machine_type_id)"
+
+  load_creds_from_strapi || log "WARNING: could not load creds from Strapi cred entity — falling back to any locally-provided TAILSCALE_AUTHKEY/ANYDESK_PASSWORD"
 
   install_base_packages
   configure_ssh
