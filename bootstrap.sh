@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -Eeuo pipefail
+shopt -s inherit_errexit
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
@@ -294,6 +295,23 @@ generate_password() {
   fi
 }
 
+set_anydesk_password() {
+  local password="$1"
+  local attempt
+
+  for attempt in 1 2 3 4 5; do
+    if printf "%s\n" "$password" | anydesk --set-password; then
+      log "AnyDesk password set successfully (attempt $attempt)"
+      return 0
+    fi
+    log "AnyDesk password attempt $attempt failed (exit $?); AnyDesk's IPC can be briefly unready after a (re)start — retrying in 3s"
+    sleep 3
+  done
+
+  log "WARNING: AnyDesk password command failed after 5 attempts"
+  return 1
+}
+
 install_base_packages() {
   log_section "Base Packages"
   log "Updating package index"
@@ -408,7 +426,7 @@ reinstall_anydesk() {
 
   if systemctl is-active anydesk >/dev/null 2>&1; then
     log "Setting AnyDesk unattended-access password"
-    printf "%s\n" "$ANYDESK_PASSWORD" | anydesk --set-password || log "WARNING: AnyDesk password command failed"
+    set_anydesk_password "$ANYDESK_PASSWORD" || true
   else
     log "WARNING: AnyDesk service is not active — cannot set password"
     systemctl status anydesk --no-pager || true
@@ -652,6 +670,17 @@ register_machine_in_strapi() {
     curl_json_logged GET "$STRAPI_BASE_URL/api/machines?filters[serial_number][\$eq]=$serial_number&pagination[pageSize]=1" "$token" |
       python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); print(data[0]["id"] if data else "")'
   )"
+
+  if [ -z "$existing_id" ] && [ -n "$anydesk_id" ]; then
+    log "No match by serial_number; checking Strapi for existing machine with anydesk_id=$anydesk_id"
+    existing_id="$(
+      curl_json_logged GET "$STRAPI_BASE_URL/api/machines?filters[anydesk_id][\$eq]=$anydesk_id&pagination[pageSize]=1" "$token" |
+        python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); print(data[0]["id"] if data else "")'
+    )"
+    if [ -n "$existing_id" ]; then
+      log "Found existing Strapi machine id=$existing_id by anydesk_id — this physical machine was previously registered under a different serial_number"
+    fi
+  fi
 
   payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id")"
 
