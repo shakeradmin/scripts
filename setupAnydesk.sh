@@ -119,7 +119,6 @@ echo
 if [ "$SERVICE_STATUS" != "active" ]; then
 log "WARNING: AnyDesk service is not active."
 
-```
 echo
 echo "===== SERVICE STATUS ====="
 sudo systemctl status anydesk --no-pager || true
@@ -128,7 +127,6 @@ echo
 echo "===== JOURNAL LOGS ====="
 journalctl -u anydesk -n 50 --no-pager || true
 echo
-```
 
 fi
 
@@ -141,10 +139,8 @@ fi
 if [ "$SERVICE_STATUS" = "active" ]; then
 log "Setting unattended-access password..."
 
-```
 echo "$PASSWORD" | sudo anydesk --set-password || \
 log "WARNING: Password command returned an error."
-```
 
 fi
 
