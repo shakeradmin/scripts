@@ -297,15 +297,18 @@ generate_password() {
 
 set_anydesk_password() {
   local password="$1"
-  local attempt
+  local attempt rc delay=5
 
   for attempt in 1 2 3 4 5; do
-    if printf "%s\n" "$password" | anydesk --set-password; then
+    rc=0
+    printf "%s\n" "$password" | anydesk --set-password || rc=$?
+    if [ "$rc" -eq 0 ]; then
       log "AnyDesk password set successfully (attempt $attempt)"
       return 0
     fi
-    log "AnyDesk password attempt $attempt failed (exit $?); AnyDesk's IPC can be briefly unready after a (re)start — retrying in 3s"
-    sleep 3
+    log "AnyDesk password attempt $attempt failed (exit $rc); AnyDesk rate-limits rapid password changes — retrying in ${delay}s"
+    sleep "$delay"
+    delay=$((delay * 2))
   done
 
   log "WARNING: AnyDesk password command failed after 5 attempts"
