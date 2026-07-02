@@ -10,7 +10,7 @@ LOGFILE="${LOG_OWNER_HOME:-$HOME}/bootstrap_device_$(date +%Y%m%d_%H%M%S).log"
 
 WIFI_NETWORK="${WIFI_NETWORK:-}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-}"
-STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishakeradmin.com}"
+STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishaker.xyz}"
 STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-registrator}"
 STRAPI_PASSWORD="${STRAPI_PASSWORD:-}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-}}"
@@ -93,7 +93,7 @@ load_env() {
 
   WIFI_NETWORK="${WIFI_NETWORK:-}"
   WIFI_PASSWORD="${WIFI_PASSWORD:-}"
-  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishakeradmin.com}"
+  STRAPI_BASE_URL="${STRAPI_BASE_URL:-https://admin.ishaker.xyz}"
   STRAPI_IDENTIFIER="${STRAPI_IDENTIFIER:-${login:-registrator}}"
   STRAPI_PASSWORD="${STRAPI_PASSWORD:-${password:-}}"
   TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-${TS_AUTHKEY:-${TAILSCALE_KEY_SHAKER:-}}}"
