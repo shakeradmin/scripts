@@ -19,7 +19,7 @@ TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
 TAILSCALE_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
 TAILSCALE_ADVERTISE_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
 RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
-ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-true}"
+ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
 SSH_LOGIN_USER="${SSH_LOGIN_USER:-}"
 SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
 ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
@@ -116,7 +116,7 @@ load_env() {
   TAILSCALE_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
   TAILSCALE_ADVERTISE_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
   RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
-  ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-true}"
+  ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
   SSH_LOGIN_USER="${SSH_LOGIN_USER:-${SUDO_USER:-$(id -un)}}"
   SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
   ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
@@ -397,48 +397,44 @@ EOF
 reinstall_anydesk() {
   log_section "AnyDesk Setup"
 
-  if command -v anydesk >/dev/null 2>&1 && systemctl is-active anydesk >/dev/null 2>&1; then
-    log "AnyDesk already installed and running — skipping reinstall"
-  else
-    log "Stopping and removing old AnyDesk installation"
-    systemctl stop anydesk 2>/dev/null || true
-    systemctl disable anydesk 2>/dev/null || true
-    apt-get purge -y anydesk || true
-    apt-get autoremove -y || true
-    rm -rf /etc/anydesk /var/lib/anydesk /var/log/anydesk
-    rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.anydesk"
-    rm -f /etc/apt/sources.list.d/anydesk.list /etc/apt/keyrings/anydesk.gpg
+  log "Removing any existing AnyDesk installation (always reinstalling from scratch)"
+  systemctl stop anydesk 2>/dev/null || true
+  systemctl disable anydesk 2>/dev/null || true
+  apt-get purge -y anydesk || true
+  apt-get autoremove -y || true
+  rm -rf /etc/anydesk /var/lib/anydesk /var/log/anydesk
+  rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.anydesk"
+  rm -f /etc/apt/sources.list.d/anydesk.list /etc/apt/keyrings/anydesk.gpg
 
-    log "Adding AnyDesk repository"
-    mkdir -p /etc/apt/keyrings
-    if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg; then
-      log "ERROR: failed to download or install AnyDesk repository key"
-      return 1
-    fi
-    echo "deb [signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" >/etc/apt/sources.list.d/anydesk.list
-
-    log "Installing AnyDesk"
-    apt-get update || {
-      log "ERROR: apt-get update failed after adding AnyDesk repository"
-      sed -n '1,120p' /etc/apt/sources.list.d/anydesk.list 2>/dev/null || true
-      return 1
-    }
-    apt_install anydesk || {
-      log "ERROR: AnyDesk package installation failed"
-      apt-cache policy anydesk 2>/dev/null || true
-      return 1
-    }
-
-    systemctl daemon-reload
-    systemctl enable anydesk
-    if ! systemctl restart anydesk; then
-      log "ERROR: failed to restart AnyDesk"
-      systemctl status anydesk --no-pager || true
-      journalctl -u anydesk -n 100 --no-pager || true
-      return 1
-    fi
-    sleep 15
+  log "Adding AnyDesk repository"
+  mkdir -p /etc/apt/keyrings
+  if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg; then
+    log "ERROR: failed to download or install AnyDesk repository key"
+    return 1
   fi
+  echo "deb [signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" >/etc/apt/sources.list.d/anydesk.list
+
+  log "Installing AnyDesk"
+  apt-get update || {
+    log "ERROR: apt-get update failed after adding AnyDesk repository"
+    sed -n '1,120p' /etc/apt/sources.list.d/anydesk.list 2>/dev/null || true
+    return 1
+  }
+  apt_install anydesk || {
+    log "ERROR: AnyDesk package installation failed"
+    apt-cache policy anydesk 2>/dev/null || true
+    return 1
+  }
+
+  systemctl daemon-reload
+  systemctl enable anydesk
+  if ! systemctl restart anydesk; then
+    log "ERROR: failed to restart AnyDesk"
+    systemctl status anydesk --no-pager || true
+    journalctl -u anydesk -n 100 --no-pager || true
+    return 1
+  fi
+  sleep 15
 
   if [ -z "$ANYDESK_PASSWORD" ]; then
     ANYDESK_PASSWORD="$(generate_password)"
@@ -467,10 +463,13 @@ get_anydesk_id() {
 }
 
 install_tailscale() {
-  if command -v tailscale >/dev/null 2>&1; then
-    log "Tailscale is already installed"
-    return
-  fi
+  log "Removing any existing Tailscale installation (always reinstalling from scratch)"
+  tailscale logout >/dev/null 2>&1 || true
+  systemctl stop tailscaled 2>/dev/null || true
+  apt-get purge -y tailscale || true
+  apt-get autoremove -y || true
+  rm -rf /var/lib/tailscale /etc/default/tailscaled
+  rm -f /etc/apt/sources.list.d/tailscale.list /usr/share/keyrings/tailscale-archive-keyring.gpg
 
   local os_codename
   os_codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"
@@ -502,20 +501,7 @@ configure_tailscale() {
 
   install_tailscale
 
-  if [ "$RESET_TAILSCALE_STATE" != "true" ] && tailscale status >/dev/null 2>&1; then
-    log "Tailscale already installed and authenticated — skipping reconfiguration"
-    tailscale status || true
-    return
-  fi
-
   local up_args=()
-
-  if [ "$RESET_TAILSCALE_STATE" = "true" ]; then
-    log "Resetting local Tailscale identity state"
-    tailscale logout >/dev/null 2>&1 || true
-    systemctl stop tailscaled || true
-    rm -f /var/lib/tailscale/tailscaled.state /var/lib/tailscale/tailscaled.state.conf
-  fi
 
   if [ -z "$TAILSCALE_AUTHKEY" ]; then
     log "ERROR: no Tailscale auth key available — refusing interactive login"
