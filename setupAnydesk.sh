@@ -140,14 +140,16 @@ if [ "$SERVICE_STATUS" = "active" ]; then
 log "Setting unattended-access password..."
 
 PASSWORD_SET=0
+DELAY=5
 for attempt in 1 2 3 4 5; do
   if echo "$PASSWORD" | sudo anydesk --set-password; then
     log "Password set successfully (attempt $attempt)"
     PASSWORD_SET=1
     break
   fi
-  log "Password attempt $attempt failed; AnyDesk's IPC can be briefly unready after a (re)start — retrying in 3s"
-  sleep 3
+  log "Password attempt $attempt failed; AnyDesk rate-limits rapid password changes — retrying in ${DELAY}s"
+  sleep "$DELAY"
+  DELAY=$((DELAY * 2))
 done
 
 if [ "$PASSWORD_SET" -ne 1 ]; then
