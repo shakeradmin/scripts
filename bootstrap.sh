@@ -23,6 +23,7 @@ ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
 SSH_LOGIN_USER="${SSH_LOGIN_USER:-}"
 SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
 ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
+RUSTDESK_PASSWORD="${RUSTDESK_PASSWORD:-}"
 MACHINE_TYPE="${MACHINE_TYPE:-small}"
 MACHINE_STATUS="${MACHINE_STATUS:-new}"
 MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
@@ -73,6 +74,7 @@ on_error() {
   log "Default route: $(ip route show default 2>/dev/null | head -n1 || echo unavailable)"
   log "SSH service: $(systemctl is-active ssh 2>/dev/null || echo unavailable)"
   log "AnyDesk service: $(systemctl is-active anydesk 2>/dev/null || echo unavailable)"
+  log "RustDesk service: $(systemctl is-active rustdesk 2>/dev/null || echo unavailable)"
   log "Tailscale service: $(systemctl is-active tailscaled 2>/dev/null || echo unavailable)"
 }
 
@@ -120,6 +122,7 @@ load_env() {
   SSH_LOGIN_USER="${SSH_LOGIN_USER:-${SUDO_USER:-$(id -un)}}"
   SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
   ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
+  RUSTDESK_PASSWORD="${RUSTDESK_PASSWORD:-}"
   MACHINE_TYPE="${MACHINE_TYPE:-small}"
   MACHINE_STATUS="${MACHINE_STATUS:-new}"
   MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
@@ -462,6 +465,120 @@ get_anydesk_id() {
   printf "%s" "$id_value"
 }
 
+set_rustdesk_password() {
+  local password="$1"
+  local attempt rc delay=5
+
+  for attempt in 1 2 3 4 5; do
+    rc=0
+    rustdesk --password "$password" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      log "RustDesk password set successfully (attempt $attempt)"
+      return 0
+    fi
+    if [ "$attempt" -eq 5 ]; then
+      break
+    fi
+    log "RustDesk password attempt $attempt failed (exit $rc); retrying in ${delay}s"
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+
+  record_warning "RustDesk password command failed after 5 attempts"
+  return 1
+}
+
+reinstall_rustdesk() {
+  log_section "RustDesk Setup"
+
+  log "Removing any existing RustDesk installation (always reinstalling from scratch)"
+  systemctl stop rustdesk 2>/dev/null || true
+  systemctl disable rustdesk 2>/dev/null || true
+  apt-get purge -y rustdesk || true
+  apt-get autoremove -y || true
+  rm -rf /etc/rustdesk /usr/share/rustdesk /var/log/rustdesk
+  rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.config/rustdesk"
+  rm -f /tmp/rustdesk-install.deb
+
+  local arch rd_arch deb_url
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64) rd_arch="x86_64" ;;
+    arm64) rd_arch="aarch64" ;;
+    armhf) rd_arch="armv7" ;;
+    *) rd_arch="x86_64" ;;
+  esac
+
+  log "Fetching latest RustDesk release metadata (arch: $rd_arch)"
+  deb_url="$(
+    curl -fsSL https://api.github.com/repos/rustdesk/rustdesk/releases/latest |
+      RD_ARCH="$rd_arch" python3 -c '
+import json, os, sys
+data = json.load(sys.stdin)
+arch = os.environ["RD_ARCH"]
+best = ""
+for asset in data.get("assets", []):
+    name = asset["name"]
+    if name.endswith(".deb") and arch in name and "sciter" not in name:
+        best = asset["browser_download_url"]
+        break
+print(best)
+'
+  )"
+
+  if [ -z "$deb_url" ]; then
+    log "ERROR: could not determine RustDesk .deb download URL"
+    return 1
+  fi
+
+  log "Downloading RustDesk package from: $deb_url"
+  if ! curl -fsSL "$deb_url" -o /tmp/rustdesk-install.deb; then
+    log "ERROR: failed to download RustDesk package"
+    return 1
+  fi
+
+  log "Installing RustDesk"
+  apt-get update || true
+  apt_install /tmp/rustdesk-install.deb || {
+    log "ERROR: RustDesk package installation failed"
+    return 1
+  }
+
+  systemctl daemon-reload
+  systemctl enable rustdesk 2>/dev/null || true
+  systemctl restart rustdesk 2>/dev/null || true
+  sleep 10
+
+  local service_status
+  service_status="$(systemctl is-active rustdesk 2>/dev/null || echo inactive)"
+  log "RustDesk service status: $service_status"
+
+  if [ "$service_status" != "active" ]; then
+    log "RustDesk service is not active (may be normal on builds without a system service — continuing)"
+    systemctl status rustdesk --no-pager || true
+    journalctl -u rustdesk -n 100 --no-pager || true
+  fi
+
+  if [ -z "$RUSTDESK_PASSWORD" ]; then
+    RUSTDESK_PASSWORD="$(generate_password)"
+    log "No RUSTDESK_PASSWORD available; generated a random one"
+  fi
+
+  log "Setting RustDesk unattended-access password"
+  set_rustdesk_password "$RUSTDESK_PASSWORD" || true
+}
+
+get_rustdesk_id() {
+  local id_value
+  id_value="$(rustdesk --get-id 2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$id_value" ]; then
+    log "WARNING: RustDesk ID is unavailable from rustdesk --get-id"
+  else
+    log "RustDesk ID detected: $id_value"
+  fi
+  printf "%s" "$id_value"
+}
+
 install_tailscale() {
   log "Removing any existing Tailscale installation (always reinstalling from scratch)"
   tailscale logout >/dev/null 2>&1 || true
@@ -625,9 +742,9 @@ curl_json_logged() {
 }
 
 load_creds_from_strapi() {
-  local token creds_json ts_key anydesk_password
+  local token creds_json ts_key anydesk_password rustdesk_password
 
-  log "Fetching TS_KEY/ANYDESK_PASSWORD from Strapi cred entity"
+  log "Fetching TS_KEY/ANYDESK_PASSWORD/RUSTDESK_PASSWORD from Strapi cred entity"
   token="$(strapi_token)"
   creds_json="$(curl_json_logged GET "$STRAPI_BASE_URL/api/cred" "$token")" || {
     log "ERROR: failed to fetch Strapi cred entity"
@@ -636,6 +753,7 @@ load_creds_from_strapi() {
 
   ts_key="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("TS_KEY") or "")')"
   anydesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("ANYDESK_PASSWORD") or "")')"
+  rustdesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("RUSTDESK_PASSWORD") or "")')"
 
   if [ -z "$TAILSCALE_AUTHKEY" ] && [ -n "$ts_key" ]; then
     TAILSCALE_AUTHKEY="$ts_key"
@@ -646,6 +764,11 @@ load_creds_from_strapi() {
     ANYDESK_PASSWORD="$anydesk_password"
     log "Loaded ANYDESK_PASSWORD from Strapi cred entity"
   fi
+
+  if [ -z "$RUSTDESK_PASSWORD" ] && [ -n "$rustdesk_password" ]; then
+    RUSTDESK_PASSWORD="$rustdesk_password"
+    log "Loaded RUSTDESK_PASSWORD from Strapi cred entity"
+  fi
 }
 
 json_payload() {
@@ -653,6 +776,7 @@ json_payload() {
   ANYDESK_ID="$2" \
   TAILSCALE_IP_VALUE="$3" \
   MACHINE_TYPE_ID_VALUE="$4" \
+  RUSTDESK_ID_VALUE="$5" \
   python3 - <<'PY'
 import json
 import os
@@ -663,6 +787,7 @@ data = {
     "serial_number": os.environ["MACHINE_SERIAL"],
     "tailscale_ip": os.environ["TAILSCALE_IP_VALUE"] or None,
     "machine_type": int(os.environ["MACHINE_TYPE_ID_VALUE"]) if os.environ["MACHINE_TYPE_ID_VALUE"] else None,
+    "rustdesk_id": os.environ["RUSTDESK_ID_VALUE"] or None,
 }
 
 print(json.dumps({"data": data}))
@@ -674,6 +799,7 @@ register_machine_in_strapi() {
   local anydesk_id="$2"
   local tailscale_ip="$3"
   local machine_type_id="$4"
+  local rustdesk_id="$5"
   local token existing_id payload response
 
   require_command python3
@@ -697,7 +823,7 @@ register_machine_in_strapi() {
     fi
   fi
 
-  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id")"
 
   if [ -n "$existing_id" ]; then
     log "Updating existing Strapi machine id=$existing_id"
@@ -716,6 +842,7 @@ write_credentials_file() {
   local anydesk_id="$3"
   local tailscale_ip="$4"
   local tailscale_hostname="$5"
+  local rustdesk_id="$6"
   local credentials_file="$SCRIPT_DIR/bootstrap-credentials-${serial_number}.txt"
 
   umask 077
@@ -731,6 +858,8 @@ write_credentials_file() {
     echo "Tailscale hostname: $tailscale_hostname"
     echo "AnyDesk ID: $anydesk_id"
     echo "AnyDesk password: $ANYDESK_PASSWORD"
+    echo "RustDesk ID: $rustdesk_id"
+    echo "RustDesk password: $RUSTDESK_PASSWORD"
     echo "Bootstrap log: $LOGFILE"
   } >"$credentials_file"
 
@@ -777,12 +906,17 @@ main() {
   install_base_packages
   configure_ssh
   reinstall_anydesk
+  reinstall_rustdesk
   configure_tailscale
 
-  local anydesk_id tailscale_ip tailscale_hostname now_iso machine_id
+  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id
   anydesk_id="$(get_anydesk_id)"
   if [ -z "$anydesk_id" ]; then
     record_warning "AnyDesk ID is unavailable from anydesk --get-id"
+  fi
+  rustdesk_id="$(get_rustdesk_id)"
+  if [ -z "$rustdesk_id" ]; then
+    record_warning "RustDesk ID is unavailable from rustdesk --get-id"
   fi
   tailscale_ip="$(get_tailscale_ip)"
   if [ -z "$tailscale_ip" ]; then
@@ -790,9 +924,9 @@ main() {
   fi
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id")"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id")"
 
-  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname"
+  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
     chown "$SUDO_USER:$SUDO_USER" "$LOGFILE" || true
   fi
@@ -809,6 +943,7 @@ main() {
   echo "Serial number     : $serial_number"
   echo "Hostname          : $(hostname)"
   echo "AnyDesk ID        : ${anydesk_id:-unavailable}"
+  echo "RustDesk ID       : ${rustdesk_id:-unavailable}"
   echo "Tailscale IPv4    : ${tailscale_ip:-unavailable}"
   echo "Tailscale hostname: ${tailscale_hostname:-unavailable}"
   echo "SSH user          : $SSH_LOGIN_USER"
