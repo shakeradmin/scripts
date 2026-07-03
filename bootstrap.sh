@@ -22,6 +22,7 @@ RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
 ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
 SSH_LOGIN_USER="${SSH_LOGIN_USER:-}"
 SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
+SSH_PORT="${SSH_PORT:-22}"
 ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
 RUSTDESK_PASSWORD="${RUSTDESK_PASSWORD:-}"
 MACHINE_TYPE="${MACHINE_TYPE:-small}"
@@ -121,6 +122,7 @@ load_env() {
   ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
   SSH_LOGIN_USER="${SSH_LOGIN_USER:-${SUDO_USER:-$(id -un)}}"
   SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
+  SSH_PORT="${SSH_PORT:-22}"
   ANYDESK_PASSWORD="${ANYDESK_PASSWORD:-}"
   RUSTDESK_PASSWORD="${RUSTDESK_PASSWORD:-}"
   MACHINE_TYPE="${MACHINE_TYPE:-small}"
@@ -377,6 +379,7 @@ configure_ssh() {
 
   mkdir -p /etc/ssh/sshd_config.d
   cat >/etc/ssh/sshd_config.d/10-bootstrap-device.conf <<EOF
+Port $SSH_PORT
 PasswordAuthentication $password_auth
 KbdInteractiveAuthentication $kbd_interactive_auth
 ChallengeResponseAuthentication no
@@ -796,17 +799,36 @@ json_payload() {
   TAILSCALE_IP_VALUE="$3" \
   MACHINE_TYPE_ID_VALUE="$4" \
   RUSTDESK_ID_VALUE="$5" \
+  TAILSCALE_HOSTNAME_VALUE="$6" \
+  HOSTNAME_VALUE="$7" \
+  SSH_USER_VALUE="$SSH_LOGIN_USER" \
+  SSH_PORT_VALUE="$SSH_PORT" \
+  BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
+  UNITY_VERSION_VALUE="$UNITY_VERSION" \
+  SSD_VERSION_VALUE="$SSD_VERSION" \
   python3 - <<'PY'
 import json
 import os
 
+
+def env_or_none(key):
+    return os.environ.get(key) or None
+
+
 data = {
     "status": "new",
-    "anydesk_id": os.environ["ANYDESK_ID"] or None,
+    "anydesk_id": env_or_none("ANYDESK_ID"),
     "serial_number": os.environ["MACHINE_SERIAL"],
-    "tailscale_ip": os.environ["TAILSCALE_IP_VALUE"] or None,
+    "tailscale_ip": env_or_none("TAILSCALE_IP_VALUE"),
     "machine_type": int(os.environ["MACHINE_TYPE_ID_VALUE"]) if os.environ["MACHINE_TYPE_ID_VALUE"] else None,
-    "rustdesk_id": os.environ["RUSTDESK_ID_VALUE"] or None,
+    "rustdesk_id": env_or_none("RUSTDESK_ID_VALUE"),
+    "tailscale_hostname": env_or_none("TAILSCALE_HOSTNAME_VALUE"),
+    "hostname": env_or_none("HOSTNAME_VALUE"),
+    "ssh_user": env_or_none("SSH_USER_VALUE"),
+    "ssh_port": int(os.environ["SSH_PORT_VALUE"]) if os.environ.get("SSH_PORT_VALUE") else None,
+    "bootstrap_version": env_or_none("BOOTSTRAP_VERSION_VALUE"),
+    "unity_version": env_or_none("UNITY_VERSION_VALUE"),
+    "ssd_version": env_or_none("SSD_VERSION_VALUE"),
 }
 
 print(json.dumps({"data": data}))
@@ -819,13 +841,15 @@ register_machine_in_strapi() {
   local tailscale_ip="$3"
   local machine_type_id="$4"
   local rustdesk_id="$5"
+  local tailscale_hostname="$6"
+  local hostname_value="$7"
   local token payload response
 
   require_command python3
 
   token="$(strapi_token)"
 
-  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value")"
 
   log "Creating new Strapi machine (bootstrap never edits existing machine records)"
   response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
@@ -850,7 +874,7 @@ write_credentials_file() {
     echo "Hostname: $(hostname)"
     echo "SSH user: $SSH_LOGIN_USER"
     echo "Linux password changed by bootstrap: no"
-    echo "SSH port: 22"
+    echo "SSH port: $SSH_PORT"
     echo "Tailscale IPv4: $tailscale_ip"
     echo "Tailscale hostname: $tailscale_hostname"
     echo "AnyDesk ID: $anydesk_id"
@@ -921,7 +945,7 @@ main() {
   fi
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id")"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)")"
 
   write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
@@ -944,7 +968,7 @@ main() {
   echo "Tailscale IPv4    : ${tailscale_ip:-unavailable}"
   echo "Tailscale hostname: ${tailscale_hostname:-unavailable}"
   echo "SSH user          : $SSH_LOGIN_USER"
-  echo "SSH port          : 22"
+  echo "SSH port          : $SSH_PORT"
   echo "Log file          : $LOGFILE"
 
   if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
