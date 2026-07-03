@@ -693,20 +693,30 @@ PY
   )"
 
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' "$STRAPI_BASE_URL/api/auth/local" \
-    -H 'Content-Type: application/json' \
-    --data-binary "$auth_payload")"
+  local attempt delay=5
+  for attempt in 1 2 3 4; do
+    status="$(curl -sS -o "$response_file" -w '%{http_code}' "$STRAPI_BASE_URL/api/auth/local" \
+      -H 'Content-Type: application/json' \
+      --data-binary "$auth_payload")"
 
-  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-    log "ERROR: Strapi auth failed with HTTP $status"
-    log "Response body:"
-    sed -n '1,240p' "$response_file" >&2 || true
-    rm -f "$response_file"
-    return 1
-  fi
+    if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["jwt"])' <"$response_file"
+      rm -f "$response_file"
+      return 0
+    fi
 
-  python3 -c 'import json,sys; print(json.load(sys.stdin)["jwt"])' <"$response_file"
-  rm -f "$response_file"
+    if [ "$status" -lt 500 ] || [ "$attempt" -eq 4 ]; then
+      log "ERROR: Strapi auth failed with HTTP $status"
+      log "Response body:"
+      sed -n '1,240p' "$response_file" >&2 || true
+      rm -f "$response_file"
+      return 1
+    fi
+
+    log "Strapi auth got HTTP $status (server-side/transient) — retrying in ${delay}s (attempt $attempt/4)"
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
 }
 
 curl_json_logged() {
@@ -714,31 +724,40 @@ curl_json_logged() {
   local url="$2"
   local token="$3"
   local payload="${4:-}"
-  local response_file status
+  local response_file status attempt delay=5
 
   response_file="$(mktemp)"
   log "Strapi request: $method $url"
 
-  if [ -n "$payload" ]; then
-    status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
-      -H "Authorization: Bearer $token" \
-      -H 'Content-Type: application/json' \
-      --data-binary "$payload")"
-  else
-    status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
-      -H "Authorization: Bearer $token")"
-  fi
+  for attempt in 1 2 3 4; do
+    if [ -n "$payload" ]; then
+      status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
+        -H "Authorization: Bearer $token" \
+        -H 'Content-Type: application/json' \
+        --data-binary "$payload")"
+    else
+      status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
+        -H "Authorization: Bearer $token")"
+    fi
 
-  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-    log "ERROR: Strapi request failed with HTTP $status"
-    log "Response body:"
-    sed -n '1,240p' "$response_file" >&2 || true
-    rm -f "$response_file"
-    return 1
-  fi
+    if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+      cat "$response_file"
+      rm -f "$response_file"
+      return 0
+    fi
 
-  cat "$response_file"
-  rm -f "$response_file"
+    if [ "$status" -lt 500 ] || [ "$attempt" -eq 4 ]; then
+      log "ERROR: Strapi request failed with HTTP $status"
+      log "Response body:"
+      sed -n '1,240p' "$response_file" >&2 || true
+      rm -f "$response_file"
+      return 1
+    fi
+
+    log "Strapi request got HTTP $status (server-side/transient) — retrying in ${delay}s (attempt $attempt/4)"
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
 }
 
 load_creds_from_strapi() {
