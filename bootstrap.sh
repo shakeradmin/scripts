@@ -31,6 +31,12 @@ MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
 UNITY_VERSION="${UNITY_VERSION:-}"
 SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
+MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
+MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
+MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
+MANAGE_PASSWORD="${MANAGE_PASSWORD:-}"
+MANAGE_ORG_ID="${MANAGE_ORG_ID:-1}"
 
 STRAPI_PASSWORD_FILE="$(mktemp /tmp/.bootstrap_strapi_pw.XXXXXX)"
 chmod 600 "$STRAPI_PASSWORD_FILE"
@@ -131,6 +137,12 @@ load_env() {
   UNITY_VERSION="${UNITY_VERSION:-}"
   SSD_VERSION="${SSD_VERSION:-}"
   BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+  MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
+  MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
+  MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
+  MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
+  MANAGE_PASSWORD="${MANAGE_PASSWORD:-}"
+  MANAGE_ORG_ID="${MANAGE_ORG_ID:-1}"
 }
 
 require_root() {
@@ -857,6 +869,63 @@ register_machine_in_strapi() {
   echo "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d["id"])'
 }
 
+manage_token() {
+  if [ -z "$MANAGE_PASSWORD" ]; then
+    MANAGE_PASSWORD="$(read_secret_tty "Enter manage.ishakerusa.com password for $MANAGE_USERNAME: ")"
+  fi
+
+  local response_file status
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' "$MANAGE_KEYCLOAK_TOKEN_URL" \
+    --data-urlencode "grant_type=password" \
+    --data-urlencode "client_id=$MANAGE_CLIENT_ID" \
+    --data-urlencode "username=$MANAGE_USERNAME" \
+    --data-urlencode "password=$MANAGE_PASSWORD")"
+
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <"$response_file"
+    rm -f "$response_file"
+    return 0
+  fi
+
+  log "ERROR: manage.ishakerusa.com auth failed with HTTP $status"
+  rm -f "$response_file"
+  return 1
+}
+
+fetch_reg_code() {
+  log_section "Telemetry REG Code (org $MANAGE_ORG_ID)"
+  local token response_file status code
+
+  token="$(manage_token)" || {
+    record_warning "Could not authenticate to manage.ishakerusa.com — skipping REG code fetch"
+    return 1
+  }
+
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' -X POST \
+    "$MANAGE_API_BASE/api/telemetry-machine-control/registration-code/create-or-get/$MANAGE_ORG_ID" \
+    -H "Authorization: Bearer $token")"
+
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    code="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("code") or "")' <"$response_file")"
+    rm -f "$response_file"
+    if [ -n "$code" ]; then
+      log "Telemetry REG code for org $MANAGE_ORG_ID: $code"
+      printf "%s" "$code"
+      return 0
+    fi
+    record_warning "manage.ishakerusa.com returned no REG code"
+    return 1
+  fi
+
+  log "ERROR: REG code fetch failed with HTTP $status"
+  sed -n '1,120p' "$response_file" >&2 || true
+  rm -f "$response_file"
+  record_warning "Could not fetch telemetry REG code from manage.ishakerusa.com"
+  return 1
+}
+
 write_credentials_file() {
   local machine_id="$1"
   local serial_number="$2"
@@ -864,6 +933,7 @@ write_credentials_file() {
   local tailscale_ip="$4"
   local tailscale_hostname="$5"
   local rustdesk_id="$6"
+  local reg_code="${7:-}"
   local credentials_file="$SCRIPT_DIR/bootstrap-credentials-${serial_number}.txt"
 
   umask 077
@@ -881,6 +951,7 @@ write_credentials_file() {
     echo "AnyDesk password: $ANYDESK_PASSWORD"
     echo "RustDesk ID: $rustdesk_id"
     echo "RustDesk password: $RUSTDESK_PASSWORD"
+    echo "Telemetry REG code (org $MANAGE_ORG_ID): ${reg_code:-unavailable, fetch manually from manage.ishakerusa.com}"
     echo "Bootstrap log: $LOGFILE"
   } >"$credentials_file"
 
@@ -915,6 +986,9 @@ main() {
   log "RESET_TAILSCALE_STATE=$RESET_TAILSCALE_STATE"
   log "TAILSCALE_AUTHKEY present: $([ -n "$TAILSCALE_AUTHKEY" ] && echo yes || echo no)"
   log "STRAPI_PASSWORD present: $([ -n "$STRAPI_PASSWORD" ] && echo yes || echo no)"
+  log "MANAGE_ORG_ID=$MANAGE_ORG_ID"
+  log "MANAGE_USERNAME=$MANAGE_USERNAME"
+  log "MANAGE_PASSWORD present: $([ -n "$MANAGE_PASSWORD" ] && echo yes || echo no)"
 
   wait_for_online
   local serial_number
@@ -930,7 +1004,7 @@ main() {
   reinstall_rustdesk
   configure_tailscale
 
-  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id
+  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code
   anydesk_id="$(get_anydesk_id)"
   if [ -z "$anydesk_id" ]; then
     record_warning "AnyDesk ID is unavailable from anydesk --get-id"
@@ -946,8 +1020,9 @@ main() {
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)")"
+  reg_code="$(fetch_reg_code || true)"
 
-  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id"
+  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id" "$reg_code"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
     chown "$SUDO_USER:$SUDO_USER" "$LOGFILE" || true
   fi
@@ -969,7 +1044,12 @@ main() {
   echo "Tailscale hostname: ${tailscale_hostname:-unavailable}"
   echo "SSH user          : $SSH_LOGIN_USER"
   echo "SSH port          : $SSH_PORT"
+  echo "Telemetry REG code: ${reg_code:-unavailable}"
   echo "Log file          : $LOGFILE"
+  if [ -n "$reg_code" ]; then
+    echo
+    echo "Remaining manual step: enter '$reg_code' on-device via Service Menu > Telemetry > Activation key, then restart ShakerView."
+  fi
 
   if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
     echo
