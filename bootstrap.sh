@@ -819,38 +819,16 @@ register_machine_in_strapi() {
   local tailscale_ip="$3"
   local machine_type_id="$4"
   local rustdesk_id="$5"
-  local token existing_id payload response
+  local token payload response
 
   require_command python3
 
   token="$(strapi_token)"
 
-  log "Checking Strapi for existing machine with serial_number=$serial_number"
-  existing_id="$(
-    curl_json_logged GET "$STRAPI_BASE_URL/api/machines?filters[serial_number][\$eq]=$serial_number&pagination[pageSize]=1" "$token" |
-      python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); print(data[0]["id"] if data else "")'
-  )"
-
-  if [ -z "$existing_id" ] && [ -n "$anydesk_id" ]; then
-    log "No match by serial_number; checking Strapi for existing machine with anydesk_id=$anydesk_id"
-    existing_id="$(
-      curl_json_logged GET "$STRAPI_BASE_URL/api/machines?filters[anydesk_id][\$eq]=$anydesk_id&pagination[pageSize]=1" "$token" |
-        python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); print(data[0]["id"] if data else "")'
-    )"
-    if [ -n "$existing_id" ]; then
-      log "Found existing Strapi machine id=$existing_id by anydesk_id — this physical machine was previously registered under a different serial_number"
-    fi
-  fi
-
   payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id")"
 
-  if [ -n "$existing_id" ]; then
-    log "Updating existing Strapi machine id=$existing_id"
-    response="$(curl_json_logged PUT "$STRAPI_BASE_URL/api/machines/$existing_id" "$token" "$payload")"
-  else
-    log "Creating new Strapi machine"
-    response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
-  fi
+  log "Creating new Strapi machine (bootstrap never edits existing machine records)"
+  response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
 
   echo "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d["id"])'
 }
