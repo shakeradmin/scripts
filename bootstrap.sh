@@ -821,6 +821,7 @@ json_payload() {
   HOSTNAME_VALUE="$7" \
   REG_CODE_VALUE="$8" \
   MACHINE_KEY_VALUE="$9" \
+  RUSTDESK_PASSWORD_VALUE="$RUSTDESK_PASSWORD" \
   SSH_USER_VALUE="$SSH_LOGIN_USER" \
   SSH_PORT_VALUE="$SSH_PORT" \
   BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
@@ -851,6 +852,7 @@ data = {
     "ssd_version": env_or_none("SSD_VERSION_VALUE"),
     "telemetry_reg_code": env_or_none("REG_CODE_VALUE"),
     "machine_key": env_or_none("MACHINE_KEY_VALUE"),
+    "rustdesk_password": env_or_none("RUSTDESK_PASSWORD_VALUE"),
 }
 
 print(json.dumps({"data": data}))
