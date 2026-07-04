@@ -814,6 +814,7 @@ json_payload() {
   TAILSCALE_HOSTNAME_VALUE="$6" \
   HOSTNAME_VALUE="$7" \
   REG_CODE_VALUE="$8" \
+  MACHINE_KEY_VALUE="$9" \
   SSH_USER_VALUE="$SSH_LOGIN_USER" \
   SSH_PORT_VALUE="$SSH_PORT" \
   BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
@@ -843,6 +844,7 @@ data = {
     "unity_version": env_or_none("UNITY_VERSION_VALUE"),
     "ssd_version": env_or_none("SSD_VERSION_VALUE"),
     "telemetry_reg_code": env_or_none("REG_CODE_VALUE"),
+    "machine_key": env_or_none("MACHINE_KEY_VALUE"),
 }
 
 print(json.dumps({"data": data}))
@@ -858,13 +860,14 @@ register_machine_in_strapi() {
   local tailscale_hostname="$6"
   local hostname_value="$7"
   local reg_code="$8"
+  local machine_key="$9"
   local token payload response
 
   require_command python3
 
   token="$(strapi_token)"
 
-  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code" "$machine_key")"
 
   log "Creating new Strapi machine (bootstrap never edits existing machine records)"
   response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
@@ -926,6 +929,84 @@ fetch_reg_code() {
   sed -n '1,120p' "$response_file" >&2 || true
   rm -f "$response_file"
   record_warning "Could not fetch telemetry REG code from manage.ishakerusa.com"
+  return 1
+}
+
+telemetry_model_name_for_type() {
+  local machine_type_id="$1"
+  local token types_json strapi_name lower
+
+  token="$(strapi_token)"
+  types_json="$(curl_json_logged GET "$STRAPI_BASE_URL/api/machine-types?pagination[pageSize]=100" "$token")" || {
+    printf "Shaker S"
+    return 0
+  }
+
+  strapi_name="$(echo "$types_json" | MACHINE_TYPE_ID="$machine_type_id" python3 -c '
+import json, os, sys
+data = json.load(sys.stdin).get("data", [])
+target = os.environ["MACHINE_TYPE_ID"]
+for item in data:
+    if str(item["id"]) == target:
+        print(item["attributes"]["name"])
+        break
+')"
+
+  lower="$(echo "$strapi_name" | tr "[:upper:]" "[:lower:]")"
+  case "$lower" in
+    *milkshaker*|*milk*) printf "Milkshaker S" ;;
+    *touch*) printf "ShakerTouch" ;;
+    *) printf "Shaker S" ;;
+  esac
+}
+
+redeem_reg_code() {
+  log_section "Telemetry Machine Registration (redeem REG code)"
+  local reg_code="$1"
+  local serial_number="$2"
+  local machine_type_id="$3"
+  local model_name payload response_file status secret_key message
+
+  model_name="$(telemetry_model_name_for_type "$machine_type_id")"
+  log "Resolved telemetry model name: $model_name"
+
+  payload="$(MODEL_NAME="$model_name" SERIAL="$serial_number" python3 -c '
+import json
+import os
+import datetime
+
+model = os.environ["MODEL_NAME"]
+print(json.dumps({
+    "modelName": model,
+    "machineName": f"{model} {datetime.datetime.now():%d.%m.%Y}",
+    "serialNumber": os.environ["SERIAL"],
+}))
+')"
+
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' -X POST \
+    "$MANAGE_API_BASE/api/telemetry-machine-control/machine/registration/$reg_code" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$payload")"
+
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    secret_key="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("secretKey") or "")' <"$response_file")"
+    message="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("message") or "")' <"$response_file")"
+    rm -f "$response_file"
+    if [ -n "$secret_key" ]; then
+      log "Telemetry MachineKey obtained automatically (no on-device REG entry needed)"
+      printf "%s" "$secret_key"
+      return 0
+    fi
+    log "Telemetry registration response had no secretKey (message: ${message:-none})"
+    record_warning "Telemetry auto-registration did not return a MachineKey (${message:-no message}) — on-device REG entry still needed"
+    return 1
+  fi
+
+  log "ERROR: telemetry registration failed with HTTP $status"
+  sed -n '1,200p' "$response_file" >&2 || true
+  rm -f "$response_file"
+  record_warning "Could not redeem telemetry REG code via API — on-device REG entry still needed"
   return 1
 }
 
@@ -1007,7 +1088,7 @@ main() {
   reinstall_rustdesk
   configure_tailscale
 
-  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code
+  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key
   anydesk_id="$(get_anydesk_id)"
   if [ -z "$anydesk_id" ]; then
     record_warning "AnyDesk ID is unavailable from anydesk --get-id"
@@ -1023,7 +1104,11 @@ main() {
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   reg_code="$(fetch_reg_code || true)"
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code")"
+  machine_key=""
+  if [ -n "$reg_code" ]; then
+    machine_key="$(redeem_reg_code "$reg_code" "$serial_number" "$machine_type_id" || true)"
+  fi
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key")"
 
   write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id" "$reg_code"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
@@ -1048,8 +1133,15 @@ main() {
   echo "SSH user          : $SSH_LOGIN_USER"
   echo "SSH port          : $SSH_PORT"
   echo "Telemetry REG code: ${reg_code:-unavailable}"
+  if [ -n "$machine_key" ]; then
+    echo "Telemetry status  : fully registered automatically (MachineKey obtained, no on-device step needed)"
+  elif [ -n "$reg_code" ]; then
+    echo "Telemetry status  : REG code fetched, but automatic redemption failed — on-device entry still required"
+  else
+    echo "Telemetry status  : not registered — fetch REG code manually from manage.ishakerusa.com"
+  fi
   echo "Log file          : $LOGFILE"
-  if [ -n "$reg_code" ]; then
+  if [ -n "$reg_code" ] && [ -z "$machine_key" ]; then
     echo
     echo "Remaining manual step: enter '$reg_code' on-device via Service Menu > Telemetry > Activation key, then restart ShakerView."
   fi
