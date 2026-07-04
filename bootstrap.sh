@@ -813,6 +813,7 @@ json_payload() {
   RUSTDESK_ID_VALUE="$5" \
   TAILSCALE_HOSTNAME_VALUE="$6" \
   HOSTNAME_VALUE="$7" \
+  REG_CODE_VALUE="$8" \
   SSH_USER_VALUE="$SSH_LOGIN_USER" \
   SSH_PORT_VALUE="$SSH_PORT" \
   BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
@@ -841,6 +842,7 @@ data = {
     "bootstrap_version": env_or_none("BOOTSTRAP_VERSION_VALUE"),
     "unity_version": env_or_none("UNITY_VERSION_VALUE"),
     "ssd_version": env_or_none("SSD_VERSION_VALUE"),
+    "telemetry_reg_code": env_or_none("REG_CODE_VALUE"),
 }
 
 print(json.dumps({"data": data}))
@@ -855,13 +857,14 @@ register_machine_in_strapi() {
   local rustdesk_id="$5"
   local tailscale_hostname="$6"
   local hostname_value="$7"
+  local reg_code="$8"
   local token payload response
 
   require_command python3
 
   token="$(strapi_token)"
 
-  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code")"
 
   log "Creating new Strapi machine (bootstrap never edits existing machine records)"
   response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
@@ -1019,8 +1022,8 @@ main() {
   fi
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)")"
   reg_code="$(fetch_reg_code || true)"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code")"
 
   write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id" "$reg_code"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
