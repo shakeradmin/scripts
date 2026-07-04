@@ -776,9 +776,9 @@ curl_json_logged() {
 }
 
 load_creds_from_strapi() {
-  local token creds_json ts_key anydesk_password rustdesk_password
+  local token creds_json ts_key anydesk_password rustdesk_password telemetry_password
 
-  log "Fetching TS_KEY/ANYDESK_PASSWORD/RUSTDESK_PASSWORD from Strapi cred entity"
+  log "Fetching TS_KEY/ANYDESK_PASSWORD/RUSTDESK_PASSWORD/TELEMETRY_PASSWORD from Strapi cred entity"
   token="$(strapi_token)"
   creds_json="$(curl_json_logged GET "$STRAPI_BASE_URL/api/cred" "$token")" || {
     log "ERROR: failed to fetch Strapi cred entity"
@@ -788,6 +788,7 @@ load_creds_from_strapi() {
   ts_key="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("TS_KEY") or "")')"
   anydesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("ANYDESK_PASSWORD") or "")')"
   rustdesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("RUSTDESK_PASSWORD") or "")')"
+  telemetry_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("TELEMETRY_PASSWORD") or "")')"
 
   if [ -z "$TAILSCALE_AUTHKEY" ] && [ -n "$ts_key" ]; then
     TAILSCALE_AUTHKEY="$ts_key"
@@ -802,6 +803,11 @@ load_creds_from_strapi() {
   if [ -z "$RUSTDESK_PASSWORD" ] && [ -n "$rustdesk_password" ]; then
     RUSTDESK_PASSWORD="$rustdesk_password"
     log "Loaded RUSTDESK_PASSWORD from Strapi cred entity"
+  fi
+
+  if [ -z "$MANAGE_PASSWORD" ] && [ -n "$telemetry_password" ]; then
+    MANAGE_PASSWORD="$telemetry_password"
+    log "Loaded MANAGE_PASSWORD (TELEMETRY_PASSWORD) from Strapi cred entity"
   fi
 }
 
