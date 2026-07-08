@@ -1,0 +1,151 @@
+================================================================================
+ diagnose.sh — pre-shipment diagnosis for GOLDEN-SSD clones
+ Companion to bootstrap.sh and check_machine.sh in shakeradmin/scripts
+ Written 2026-07-08
+================================================================================
+
+WHY A NEW SCRIPT
+--------------------------------------------------------------------------------
+bootstrap.sh provisions ONE machine from bare metal: it installs SSH / AnyDesk /
+RustDesk / Tailscale, registers the machine in Strapi (POST /api/machines) and
+redeems a telemetry REG-code against manage.ishakerusa.com to obtain a per-machine
+MachineKey. That is the correct path for a machine set up from scratch.
+
+The actual shipping workflow is different: you set up ONE "golden" machine, clone
+its SSD byte-for-byte, and drop the clone into every unit you ship. Cloning is fast
+but it copies EVERYTHING — including things that are supposed to be unique per
+machine. A clone that still carries the golden master's identity is dangerous:
+
+  * Two machines with the same telemetry MachineKey/serial is exactly the
+    2026-06-30 impersonation incident (one machine held another's Keycloak
+    credentials for a week). Clone-and-ship reproduces that failure by default.
+  * Two machines with the same Tailscale node state fight over one IP.
+  * Two machines with the same SSH host keys / systemd machine-id collide on the
+    network and defeat host-key verification.
+  * The golden image can carry leftover secrets (bootstrap logs, credential files,
+    .env, office Wi-Fi PSK, shell history) that then ship to every client.
+
+check_machine.sh already audits the on-box CONFIGURATION (prices, locale, timezone,
+remains.data, first-run wizard, currency). It does NOT look at clone identity, and
+it does NOT talk to the telemetry backend. diagnose.sh fills exactly those two gaps.
+Run BOTH before a machine leaves the building.
+
+diagnose.sh is strictly READ-ONLY. It changes nothing. Every check keeps going even
+if the previous one failed; nothing aborts the run.
+
+
+HOW TO RUN
+--------------------------------------------------------------------------------
+  bash diagnose.sh 100.100.239.36     # from your laptop: SSHes in, runs remotely
+  bash diagnose.sh                    # on the machine itself: runs locally
+  SKIP_SHAKERVIEW=1 bash diagnose.sh <ip>   # identity + OS checks only, no backend
+  SV_SERIAL=... SV_MACHINE_KEY=... SV_KK_ADDRESS=... SV_WS_ADDRESS=... bash diagnose.sh
+                                      # override auto-detected telemetry endpoint
+
+Markers:  [ OK ] fine | [WARN] check/fix | [FAIL] must fix before client | [INFO] data
+Exit code: 0 = clean, 1 = warnings only, 2 = at least one FAIL (do not ship).
+
+
+WHAT THE SCRIPT CHECKS (section by section)
+--------------------------------------------------------------------------------
+1. CLONE IDENTITY RESIDUE  — the core reason this script exists. Detects golden-
+   master identity that MUST be regenerated per unit, and prints the exact reset
+   command for each:
+     1.1 /etc/machine-id and /var/lib/dbus/machine-id (systemd identity).
+         Correct pre-clone state is EMPTY (regenerated on first boot). A populated,
+         shared machine-id causes DHCP-lease, dbus and journald collisions.
+     1.2 SSH host keys (/etc/ssh/ssh_host_*). Shows fingerprints; shared keys mean
+         every clone has the same fingerprint and host-key verification is useless.
+     1.3 Tailscale node state (/var/lib/tailscale/tailscaled.state). A clone with
+         golden's state logs in AS the golden node.
+     1.4 AnyDesk / RustDesk IDs baked into the image (only one clone connectable
+         per shared ID). bootstrap reinstalls these to mint fresh IDs — verify it did.
+     1.5 THE BIG ONE — ShakerView telemetry.json MachineKey / MachineId /
+         OrganizationId + hard_settings.json MachineSerial. If a clone ships with the
+         golden's MachineKey it IMPERSONATES the golden machine on the telemetry
+         backend. Flagged [FAIL]. Each unit needs its own REG-code redemption
+         (bootstrap does this) OR telemetry.json cleared before cloning.
+     1.6 Leftover provisioning artifacts: bootstrap_device_*.log,
+         bootstrap-credentials-*.txt, ~/.env, ~/Desktop/.env, bash_history — all can
+         leak keys/creds to the client. Remove before cloning.
+     1.7 Saved Wi-Fi profiles (office SSID + PSK stored in NetworkManager) that ship
+         inside the image.
+     1.8 Hostname still a golden/template/default placeholder.
+
+2. SSD / DISK HEALTH — you are shipping the physical disk, so its health matters:
+     - root device + free space (FAIL at >=90% full: first boot and log rotation break)
+     - SMART overall-health via smartctl (PASSED / not) if available.
+
+3. KIOSK RUNTIME READINESS:
+     - ShakerView running exactly once (0 = not selling, 2+ = duplicate)
+     - AppManager watchdog count (1 expected)
+     - GDM autologin configured (so the kiosk comes up unattended after power-on)
+     - NTP clock sync (fiscal receipts / sale timestamps drift without it)
+
+4. LIVE SHAKERVIEW TELEMETRY — the "get data from ShakerView" part. Reads the
+   machine's serial + MachineKey + KKAddress + WebSocketAddress from its own config,
+   then:
+     4.1 Keycloak client_credentials grant as the machine itself (client_id=serial,
+         client_secret=MachineKey). Success proves the machine is registered and its
+         credentials are valid — i.e. the backend will accept it at the client site.
+         Failure is a [FAIL]: the box is not properly registered.
+     4.2 Over a SHORT-LIVED WebSocket (one request/response then close — the same
+         collision-safe pattern mcp_shakerview uses, so it never competes with the
+         machine's real long-lived connection), it pulls:
+           machineInfo            -> backend's live view of the machine
+           statusMachineImportTopic -> status color SUCCESS / WARNING / ERROR
+           cellStoreRequestExport -> number of cells configured
+           cellVolumeExport       -> remains present / how many cells at zero
+           getKioskCellsTopic     -> kiosk prices, flags 0 / 50 / 100 (default-price trap)
+     The WebSocket client is hand-rolled on the Python standard library (RFC6455 over
+     a raw socket), so it needs NO pip packages on the machine — just python3, which
+     bootstrap already installs.
+
+
+ADDITIONAL PRE-CLONE / PRE-SHIP CHECKS WORTH DOING (research notes)
+--------------------------------------------------------------------------------
+Things surfaced while analysing bootstrap.sh + the ShakerView protocol map. Some are
+in diagnose.sh; the rest are process recommendations for whoever prepares the golden:
+
+  A. Before you CLONE the golden (do these ON the golden, once):
+     - Empty /etc/machine-id and /var/lib/dbus/machine-id.
+     - Remove SSH host keys so each clone regenerates its own.
+     - tailscale logout + remove tailscaled.state.
+     - Clear telemetry.json MachineKey/MachineId (or accept that bootstrap re-registers
+       each unit and OVERWRITES it — but never ship a clone that still holds the key).
+     - Delete bootstrap logs, bootstrap-credentials-*.txt, .env, and scrub bash_history.
+     - Decide whether the office Wi-Fi profile should travel with the image.
+     - Record the golden's SSD_VERSION / UNITY_VERSION / bootstrap_version so Strapi
+       stays accurate (bootstrap already writes these fields).
+
+  B. Per unit, AFTER cloning (bootstrap.sh covers most; verify):
+     - Fresh AnyDesk + RustDesk IDs (bootstrap reinstalls both).
+     - Own Tailscale membership with a per-unit hostname + tag:vending.
+     - Own Strapi /api/machines record with the REAL serial (NOTE: Strapi's
+       serial_number field is unreliable in ~40% of records — confirm against the
+       machine's own hard_settings.json MachineSerial, do not trust Strapi blindly).
+     - Own telemetry MachineKey via REG-code redemption; confirm Keycloak auth works
+       (section 4.1) rather than assuming registration succeeded.
+     - Client-specific config that is NOT identity but still must be set: timezone,
+       full locale (all LC_*), currency multiplier, real prices, remains.data,
+       first-run wizard completed — these are check_machine.sh's job.
+
+  C. Hygiene / fleet-safety notes (not blockers, but track them):
+     - The shipped ShakerView binary contains two hardcoded secrets (dev Keycloak
+       client_secret and the Cowasport api_key). Cloning spreads them further; they
+       should be rotated and moved to per-machine config. See ShakerView_API_Map.md.
+     - bootstrap.sh pulls TS_KEY / ANYDESK_PASSWORD / RUSTDESK_PASSWORD /
+       TELEMETRY_PASSWORD from the Strapi /api/cred entity at run time, so those do
+       not need to live in the golden image — keep them OUT of the clone.
+
+
+LIMITATIONS (honest)
+--------------------------------------------------------------------------------
+  - Section 4's per-topic sub-checks print inline ::OK/WARN/FAIL:: tags but only the
+    Keycloak auth result feeds the overall exit-code verdict; read the section-4
+    lines yourself. (Keeps the script single-pass and dependency-free.)
+  - diagnose.sh cannot know your specific golden's fingerprints, so it flags identity
+    that EXISTS and must be regenerated rather than proving two machines match. Set
+    GOLDEN_MACHINE_ID if you later wire in a Strapi cross-check.
+  - It does not modify anything, so it will not fix problems — it only reports them.
+================================================================================
