@@ -401,6 +401,12 @@ EOF
 
   log "Linux password will NOT be changed by this script."
 
+  # Generate host keys if missing. A golden image is scrubbed of host keys (so clones don't all
+  # share one identity); ssh-keygen -A gives THIS unit its own fresh keys. Without this, a
+  # keyless clone's sshd refuses every connection (socket-activated sshd needs keys on disk).
+  log "Ensuring SSH host keys exist (unique per unit)"
+  ssh-keygen -A || record_warning "ssh-keygen -A failed — SSH may be unreachable until host keys exist"
+
   log "Enabling SSH service"
   systemctl enable ssh
   if ! systemctl restart ssh; then
