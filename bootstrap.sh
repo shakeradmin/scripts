@@ -1054,10 +1054,67 @@ write_credentials_file() {
   log "Credentials saved to $credentials_file"
 }
 
+# When a machine is prepared by cloning a "golden" SSD, the clone carries the golden's identity.
+# Two pieces would otherwise ship unchanged and cause harm:
+#   - the golden's ShakerView telemetry secret (MachineKey/SnackKey) in telemetry.json — a clone
+#     that keeps it authenticates to the telemetry backend AS the golden (impersonation, the
+#     2026-06-30 incident shape);
+#   - stale bootstrap_device_*.log files from the golden build, which contain credentials.
+# Scrub both at the start of every bootstrap run so each unit registers cleanly as itself.
+# Telemetry files are backed up (.bak-<ts>) before editing, never blind-deleted.
+scrub_clone_identity() {
+  log_section "Scrub cloned-golden identity (telemetry secret + old bootstrap logs)"
+
+  # 1) Remove old bootstrap logs carried in the image (keep THIS run's log).
+  local home_dir="${LOG_OWNER_HOME:-$HOME}" removed=0 f
+  if [ -n "$home_dir" ] && [ -d "$home_dir" ]; then
+    for f in "$home_dir"/bootstrap_device_*.log; do
+      [ -e "$f" ] || continue
+      [ "$f" = "$LOGFILE" ] && continue
+      rm -f "$f" && removed=$((removed + 1))
+    done
+  fi
+  log "Removed $removed old bootstrap_device_*.log file(s)"
+
+  # 2) Clear the golden's telemetry secret from any on-machine telemetry.json (back up first).
+  local tj found=0
+  for tj in /home/*/ShakerView2.0Linux*/ShakerView2.0_Data/Config/telemetry.json; do
+    [ -e "$tj" ] || continue
+    found=1
+    cp -a "$tj" "${tj}.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    if TJ="$tj" python3 - <<'PY'
+import json, os, sys
+p = os.environ["TJ"]
+try:
+    with open(p, encoding="utf-8-sig") as fh:
+        d = json.load(fh)
+except Exception as e:
+    print(f"unreadable {p}: {e}", file=sys.stderr)
+    sys.exit(1)
+changed = False
+for k in ("MachineKey", "SnackKey"):  # the per-machine auth secrets — clearing kills impersonation
+    if d.get(k):
+        d[k] = ""
+        changed = True
+if changed:
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=2)
+print("scrubbed" if changed else "already-clean", p)
+PY
+    then
+      log "telemetry secret scrubbed in $tj (backup kept alongside)"
+    else
+      record_warning "Could not scrub telemetry.json at $tj — clear MachineKey manually before cloning"
+    fi
+  done
+  [ "$found" = "0" ] && log "No telemetry.json found to scrub (fresh install, nothing carried over)"
+}
+
 main() {
   protect_env_file
   load_env
   require_root
+  scrub_clone_identity
 
   echo "=============================================================="
   echo "Device Bootstrap Started"
