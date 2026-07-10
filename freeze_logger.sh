@@ -78,7 +78,9 @@ runsudo systemctl restart systemd-journald 2>/dev/null
 echo "  journald Storage: $(grep -s '^Storage=' /etc/systemd/journald.conf || echo default)"
 
 hdr "Installing resource sampler (every 20s -> /var/log/shaker_freeze.log)"
-runsudo tee /usr/local/bin/shaker_freeze_sampler.sh >/dev/null <<'SAMP'
+# NOTE: write to a temp file first, then sudo-copy. Do NOT pipe a heredoc into `runsudo tee` —
+# runsudo feeds the sudo password on stdin, which would clobber tee's input (wrote just "123").
+cat > /tmp/shaker_freeze_sampler.sh <<'SAMP'
 #!/usr/bin/env bash
 LOG=/var/log/shaker_freeze.log
 while true; do
@@ -94,6 +96,8 @@ while true; do
   sleep 20
 done
 SAMP
+runsudo cp /tmp/shaker_freeze_sampler.sh /usr/local/bin/shaker_freeze_sampler.sh
+rm -f /tmp/shaker_freeze_sampler.sh
 runsudo chmod +x /usr/local/bin/shaker_freeze_sampler.sh
 # start now (background, detached) and on every boot via root cron
 runsudo pkill -f shaker_freeze_sampler.sh 2>/dev/null
