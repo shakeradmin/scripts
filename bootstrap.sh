@@ -1032,8 +1032,14 @@ else:
       else
         log "Registration response had no recognizable machineId field — MachineId will be left null in telemetry.json"
       fi
-      apply_telemetry_credentials "$secret_key" "$telemetry_machine_id" "$MANAGE_ORG_ID"
-      printf "%s" "$secret_key"
+      # Two lines on stdout (secret_key, telemetry_machine_id) — this function's return value is
+      # captured via $(...) by the caller, so nothing else may write to stdout from in here.
+      # apply_telemetry_credentials() is deliberately NOT called from this function: it's a plain
+      # function (not a subshell) that logs via log()/prints via python, and calling it inside a
+      # command-substitution context would leak that output into the captured return value (this
+      # bit us once already — see [[bug-bootstrap-telemetry-machinekey-not-written-to-device-plus-wrong-default-org]]
+      # follow-up). The caller (main()) applies the credentials after capturing both values.
+      printf '%s\n%s\n' "$secret_key" "$telemetry_machine_id"
       return 0
     fi
     log "Telemetry registration response had no secretKey (message: ${message:-none})"
@@ -1237,7 +1243,7 @@ main() {
   reinstall_rustdesk || log "RustDesk setup failed — non-critical, continuing bootstrap without it"
   configure_tailscale
 
-  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key machine_secret
+  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key machine_secret telemetry_machine_id redeem_output
   machine_secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
   anydesk_id="$(get_anydesk_id)"
   if [ -z "$anydesk_id" ]; then
@@ -1255,8 +1261,14 @@ main() {
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   reg_code="$(fetch_reg_code || true)"
   machine_key=""
+  telemetry_machine_id=""
   if [ -n "$reg_code" ]; then
-    machine_key="$(redeem_reg_code "$reg_code" "$serial_number" "$machine_type_id" || true)"
+    redeem_output="$(redeem_reg_code "$reg_code" "$serial_number" "$machine_type_id" || true)"
+    machine_key="$(printf '%s\n' "$redeem_output" | sed -n '1p')"
+    telemetry_machine_id="$(printf '%s\n' "$redeem_output" | sed -n '2p')"
+    if [ -n "$machine_key" ]; then
+      apply_telemetry_credentials "$machine_key" "$telemetry_machine_id" "$MANAGE_ORG_ID"
+    fi
   fi
   machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret")"
 
