@@ -1113,7 +1113,9 @@ PY
       record_warning "Could not scrub telemetry.json at $tj — clear MachineKey manually before cloning"
     fi
   done
-  [ "$found" = "0" ] && log "No telemetry.json found to scrub (fresh install, nothing carried over)"
+  if [ "$found" = "0" ]; then
+    log "No telemetry.json found to scrub (fresh install, nothing carried over)"
+  fi
 }
 
 main() {
