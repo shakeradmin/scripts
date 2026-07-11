@@ -827,6 +827,7 @@ json_payload() {
   HOSTNAME_VALUE="$7" \
   REG_CODE_VALUE="$8" \
   MACHINE_KEY_VALUE="$9" \
+  MACHINE_SECRET_VALUE="${10}" \
   RUSTDESK_PASSWORD_VALUE="$RUSTDESK_PASSWORD" \
   SSH_USER_VALUE="$SSH_LOGIN_USER" \
   SSH_PORT_VALUE="$SSH_PORT" \
@@ -859,6 +860,7 @@ data = {
     "telemetry_reg_code": env_or_none("REG_CODE_VALUE"),
     "machine_key": env_or_none("MACHINE_KEY_VALUE"),
     "rustdesk_password": env_or_none("RUSTDESK_PASSWORD_VALUE"),
+    "secret": os.environ["MACHINE_SECRET_VALUE"],
 }
 
 print(json.dumps({"data": data}))
@@ -875,13 +877,14 @@ register_machine_in_strapi() {
   local hostname_value="$7"
   local reg_code="$8"
   local machine_key="$9"
+  local machine_secret="${10}"
   local token payload response
 
   require_command python3
 
   token="$(strapi_token)"
 
-  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code" "$machine_key")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code" "$machine_key" "$machine_secret")"
 
   log "Creating new Strapi machine (bootstrap never edits existing machine records)"
   response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
@@ -1032,6 +1035,7 @@ write_credentials_file() {
   local tailscale_hostname="$5"
   local rustdesk_id="$6"
   local reg_code="${7:-}"
+  local machine_secret="${8:-}"
   local credentials_file="$SCRIPT_DIR/bootstrap-credentials-${serial_number}.txt"
 
   umask 077
@@ -1050,6 +1054,8 @@ write_credentials_file() {
     echo "RustDesk ID: $rustdesk_id"
     echo "RustDesk password: $RUSTDESK_PASSWORD"
     echo "Telemetry REG code (org $MANAGE_ORG_ID): ${reg_code:-unavailable, fetch manually from manage.ishakerusa.com}"
+    echo "Strapi machine secret: $machine_secret"
+    echo "(secret is a private Strapi field — this file is the only place it will ever be readable again)"
     echo "Bootstrap log: $LOGFILE"
   } >"$credentials_file"
 
@@ -1161,7 +1167,8 @@ main() {
   reinstall_rustdesk
   configure_tailscale
 
-  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key
+  local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key machine_secret
+  machine_secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
   anydesk_id="$(get_anydesk_id)"
   if [ -z "$anydesk_id" ]; then
     record_warning "AnyDesk ID is unavailable from anydesk --get-id"
@@ -1181,9 +1188,9 @@ main() {
   if [ -n "$reg_code" ]; then
     machine_key="$(redeem_reg_code "$reg_code" "$serial_number" "$machine_type_id" || true)"
   fi
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key")"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret")"
 
-  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id" "$reg_code"
+  write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id" "$reg_code" "$machine_secret"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
     chown "$SUDO_USER:$SUDO_USER" "$LOGFILE" || true
   fi
