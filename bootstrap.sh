@@ -36,7 +36,7 @@ MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.co
 MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
 MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
 MANAGE_PASSWORD="${MANAGE_PASSWORD:-}"
-MANAGE_ORG_ID="${MANAGE_ORG_ID:-1}"
+MANAGE_ORG_ID="${MANAGE_ORG_ID:-2}"
 
 STRAPI_PASSWORD_FILE="$(mktemp /tmp/.bootstrap_strapi_pw.XXXXXX)"
 chmod 600 "$STRAPI_PASSWORD_FILE"
@@ -142,7 +142,7 @@ load_env() {
   MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
   MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
   MANAGE_PASSWORD="${MANAGE_PASSWORD:-}"
-  MANAGE_ORG_ID="${MANAGE_ORG_ID:-1}"
+  MANAGE_ORG_ID="${MANAGE_ORG_ID:-2}"
 }
 
 require_root() {
@@ -982,7 +982,7 @@ redeem_reg_code() {
   local reg_code="$1"
   local serial_number="$2"
   local machine_type_id="$3"
-  local model_name payload response_file status secret_key message
+  local model_name payload response_file status secret_key message telemetry_machine_id
 
   model_name="$(telemetry_model_name_for_type "$machine_type_id")"
   log "Resolved telemetry model name: $model_name"
@@ -1008,10 +1008,31 @@ print(json.dumps({
 
   if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
     secret_key="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("secretKey") or "")' <"$response_file")"
+    # Registration also creates the machine on the manage.ishakerusa.com side — pull its id back
+    # out so it can be written into the on-device telemetry.json alongside the MachineKey. Field
+    # name isn't nailed down from docs, so try the plausible candidates rather than assume one.
+    telemetry_machine_id="$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("machineId", "id"):
+    v = d.get(k)
+    if v:
+        print(v)
+        break
+else:
+    nested = d.get("machine") or d.get("data") or {}
+    print(nested.get("id") or "")
+' <"$response_file")"
     message="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("message") or "")' <"$response_file")"
     rm -f "$response_file"
     if [ -n "$secret_key" ]; then
       log "Telemetry MachineKey obtained automatically (no on-device REG entry needed)"
+      if [ -n "$telemetry_machine_id" ]; then
+        log "Telemetry MachineId: $telemetry_machine_id"
+      else
+        log "Registration response had no recognizable machineId field — MachineId will be left null in telemetry.json"
+      fi
+      apply_telemetry_credentials "$secret_key" "$telemetry_machine_id" "$MANAGE_ORG_ID"
       printf "%s" "$secret_key"
       return 0
     fi
@@ -1025,6 +1046,55 @@ print(json.dumps({
   rm -f "$response_file"
   record_warning "Could not redeem telemetry REG code via API — on-device REG entry still needed"
   return 1
+}
+
+# redeem_reg_code() gets a real MachineKey (and, when the API returns it, a MachineId) from
+# manage.ishakerusa.com and records them in Strapi + the local credentials file — but ShakerView
+# itself only ever reads its identity from the on-device telemetry.json, so without this step the
+# app has no way to authenticate telemetry even though registration "succeeded". Mirrors
+# scrub_clone_identity()'s file glob/backup pattern.
+apply_telemetry_credentials() {
+  log_section "Apply telemetry credentials to on-device Config"
+  local machine_key="$1"
+  local telemetry_machine_id="${2:-}"
+  local org_id="${3:-}"
+  local tj found=0
+
+  for tj in /home/*/ShakerView2.0Linux*/ShakerView2.0_Data/Config/telemetry.json; do
+    [ -e "$tj" ] || continue
+    found=1
+    cp -a "$tj" "${tj}.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    if TJ="$tj" MACHINE_KEY="$machine_key" TELEMETRY_MACHINE_ID="$telemetry_machine_id" ORG_ID="$org_id" python3 - <<'PY'
+import json, os, sys
+p = os.environ["TJ"]
+try:
+    with open(p, encoding="utf-8-sig") as fh:
+        d = json.load(fh)
+except Exception as e:
+    print(f"unreadable {p}: {e}", file=sys.stderr)
+    sys.exit(1)
+
+d["MachineKey"] = os.environ["MACHINE_KEY"]
+
+mid = os.environ.get("TELEMETRY_MACHINE_ID", "")
+d["MachineId"] = int(mid) if mid.isdigit() else None
+
+org = os.environ.get("ORG_ID", "")
+d["OrganizationId"] = int(org) if org.isdigit() else None
+
+with open(p, "w", encoding="utf-8") as fh:
+    json.dump(d, fh, ensure_ascii=False, indent=2)
+print("updated", p)
+PY
+    then
+      log "telemetry MachineKey/MachineId/OrganizationId written to $tj (backup kept alongside)"
+    else
+      record_warning "Could not write telemetry credentials to $tj — MachineKey exists in Strapi/credentials file but ShakerView won't authenticate until this is applied manually"
+    fi
+  done
+  if [ "$found" = "0" ]; then
+    record_warning "No on-device telemetry.json found to apply MachineKey to — ShakerView Config path differs from expected glob, or app not installed yet"
+  fi
 }
 
 write_credentials_file() {
