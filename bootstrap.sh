@@ -505,7 +505,7 @@ set_rustdesk_password() {
     delay=$((delay * 2))
   done
 
-  record_warning "RustDesk password command failed after 5 attempts"
+  log "WARNING: RustDesk password command failed after 5 attempts (non-critical)"
   return 1
 }
 
@@ -581,8 +581,8 @@ print(best)
   fi
 
   if [ -z "$RUSTDESK_PASSWORD" ]; then
-    RUSTDESK_PASSWORD="$(generate_password)"
-    log "No RUSTDESK_PASSWORD available; generated a random one"
+    RUSTDESK_PASSWORD="25410201ubuntu"
+    log "No RUSTDESK_PASSWORD available (env/Strapi cred); using fleet default"
   fi
 
   log "Setting RustDesk unattended-access password"
@@ -1164,7 +1164,7 @@ main() {
   install_base_packages
   configure_ssh
   reinstall_anydesk
-  reinstall_rustdesk
+  reinstall_rustdesk || log "RustDesk setup failed — non-critical, continuing bootstrap without it"
   configure_tailscale
 
   local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key machine_secret
@@ -1175,7 +1175,7 @@ main() {
   fi
   rustdesk_id="$(get_rustdesk_id)"
   if [ -z "$rustdesk_id" ]; then
-    record_warning "RustDesk ID is unavailable from rustdesk --get-id"
+    log "WARNING: RustDesk ID is unavailable from rustdesk --get-id (non-critical)"
   fi
   tailscale_ip="$(get_tailscale_ip)"
   if [ -z "$tailscale_ip" ]; then
