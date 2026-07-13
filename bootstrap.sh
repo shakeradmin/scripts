@@ -33,10 +33,15 @@ SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
 MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
 MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
+# Realm the MACHINE authenticates against (client_credentials, client_id == its serial). Used to
+# VERIFY that telemetry registration produced credentials ShakerView can actually authenticate with.
+TELEMETRY_KEYCLOAK_TOKEN_URL="${TELEMETRY_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/machine-realm/protocol/openid-connect/token}"
 MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
 MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
 MANAGE_PASSWORD="${MANAGE_PASSWORD:-}"
 MANAGE_ORG_ID="${MANAGE_ORG_ID:-2}"
+# Set to 1 by verify_telemetry_auth() once machine-realm auth is proven to work end-to-end.
+TELEMETRY_AUTH_VERIFIED=0
 
 STRAPI_PASSWORD_FILE="$(mktemp /tmp/.bootstrap_strapi_pw.XXXXXX)"
 chmod 600 "$STRAPI_PASSWORD_FILE"
@@ -1103,6 +1108,79 @@ PY
   fi
 }
 
+# ShakerView authenticates telemetry to Keycloak with client_id == hard_settings.json "MachineSerial"
+# (verified: a working machine's MachineSerial IS its machine-realm client_id). Telemetry registration
+# above mints a Keycloak client whose id is the serial_number we just registered, so the on-device
+# MachineSerial MUST be set to that same serial — otherwise ShakerView presents a stale/mismatched
+# client_id and gets 401 unauthorized_client. This is exactly what breaks cloned goldens that keep the
+# master's MachineSerial (e.g. MS-25081725). scrub_clone_identity() clears the master's KEY but not this.
+apply_hard_settings_serial() {
+  log_section "Align on-device hard_settings MachineSerial with registered serial"
+  local serial_number="$1"
+  local hs found=0
+  for hs in /home/*/ShakerView2.0Linux*/ShakerView2.0_Data/Config/hard_settings.json; do
+    [ -e "$hs" ] || continue
+    found=1
+    cp -a "$hs" "${hs}.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    if HS="$hs" SERIAL="$serial_number" python3 - <<'PY'
+import json, os, sys
+p = os.environ["HS"]
+try:
+    with open(p, encoding="utf-8-sig") as fh:
+        d = json.load(fh)
+except Exception as e:
+    print(f"unreadable {p}: {e}", file=sys.stderr)
+    sys.exit(1)
+old = d.get("MachineSerial")
+d["MachineSerial"] = os.environ["SERIAL"]
+with open(p, "w", encoding="utf-8") as fh:
+    json.dump(d, fh, ensure_ascii=False, indent=2)
+print(f"MachineSerial {old!r} -> {os.environ['SERIAL']!r}")
+PY
+    then
+      log "hard_settings MachineSerial set to $serial_number in $hs (backup kept alongside)"
+    else
+      record_warning "Could not set MachineSerial in $hs — ShakerView Keycloak client_id stays stale and telemetry will 401"
+    fi
+  done
+  if [ "$found" = "0" ]; then
+    record_warning "No on-device hard_settings.json found to set MachineSerial — telemetry client_id may be wrong"
+  fi
+}
+
+# Prove the registration actually works: request a machine-realm token exactly as ShakerView will
+# (client_credentials, client_id=serial, client_secret=MachineKey). A 2xx with an access_token means
+# telemetry auth is guaranteed to succeed on-device; anything else is surfaced loudly (warning) so it
+# gets fixed before the machine is cloned/handed off. This is the "make sure it registers" guarantee.
+verify_telemetry_auth() {
+  log_section "Verify telemetry authentication (machine-realm token)"
+  local serial_number="$1"
+  local machine_key="$2"
+  if [ -z "$machine_key" ]; then
+    record_warning "Skipping telemetry auth verification — no MachineKey was obtained"
+    return 1
+  fi
+  local response_file status
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' "$TELEMETRY_KEYCLOAK_TOKEN_URL" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "client_id=$serial_number" \
+    --data-urlencode "client_secret=$machine_key")"
+  if [ "$status" -ge 200 ] && [ "$status" -lt 300 ] && \
+     python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("access_token") else 1)' <"$response_file"; then
+    rm -f "$response_file"
+    log "Telemetry auth VERIFIED: client_id=$serial_number authenticates in machine-realm — ShakerView telemetry will connect"
+    TELEMETRY_AUTH_VERIFIED=1
+    return 0
+  fi
+  log "ERROR: telemetry auth verification failed with HTTP $status"
+  sed -n '1,50p' "$response_file" >&2 || true
+  rm -f "$response_file"
+  record_warning "Telemetry auth verification FAILED (HTTP $status) for client_id=$serial_number — ShakerView will 401; check the registered serial matches hard_settings.MachineSerial and the MachineKey is valid"
+  TELEMETRY_AUTH_VERIFIED=0
+  return 1
+}
+
 write_credentials_file() {
   local machine_id="$1"
   local serial_number="$2"
@@ -1268,6 +1346,10 @@ main() {
     telemetry_machine_id="$(printf '%s\n' "$redeem_output" | sed -n '2p')"
     if [ -n "$machine_key" ]; then
       apply_telemetry_credentials "$machine_key" "$telemetry_machine_id" "$MANAGE_ORG_ID"
+      # Registration mints a Keycloak client id == serial_number; point ShakerView's client_id
+      # (hard_settings.MachineSerial) at it, then prove the pair actually authenticates.
+      apply_hard_settings_serial "$serial_number"
+      verify_telemetry_auth "$serial_number" "$machine_key" || true
     fi
   fi
   machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret")"
@@ -1295,8 +1377,10 @@ main() {
   echo "SSH user          : $SSH_LOGIN_USER"
   echo "SSH port          : $SSH_PORT"
   echo "Telemetry REG code: ${reg_code:-unavailable}"
-  if [ -n "$machine_key" ]; then
-    echo "Telemetry status  : fully registered automatically (MachineKey obtained, no on-device step needed)"
+  if [ -n "$machine_key" ] && [ "${TELEMETRY_AUTH_VERIFIED:-0}" = "1" ]; then
+    echo "Telemetry status  : fully registered AND VERIFIED (client_id=$serial_number authenticates in machine-realm)"
+  elif [ -n "$machine_key" ]; then
+    echo "Telemetry status  : MachineKey obtained but auth verification FAILED — ShakerView will 401; check MachineSerial/key (see warnings above)"
   elif [ -n "$reg_code" ]; then
     echo "Telemetry status  : REG code fetched, but automatic redemption failed — on-device entry still required"
   else
