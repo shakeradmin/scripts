@@ -128,6 +128,7 @@ def cup_key(cup):
 
 LINE_POPULATE = urllib.parse.quote(
     "populate[cup][populate][image]=true&populate[cup][populate][default_splash][populate][images]=true"
+    "&populate[custom_splash][populate][images]=true"
     "&populate[brands][populate][logo]=true"
     "&populate[products][populate][taste][populate][main]=true"
     "&populate[products][populate][taste][populate][default_splash][populate][images]=true"
@@ -194,8 +195,14 @@ def collect(lines):
             img = unwrap(cup.get("image"))
             if img:
                 add(f"Cups/{ck}/cup-{ck}.png", img["url"])
+            # Cup splash frames: the line's own custom_splash overrides the cup's
+            # default_splash. Frames go into the cup folder keyed by the CUP key (what
+            # the app looks up via Cup.mediaKey), regardless of the source frame names.
+            line_spl = unwrap(line.get("custom_splash"))
+            line_spl_imgs = unwrap(line_spl.get("images")) if line_spl else None
             ds = unwrap(cup.get("default_splash"))
-            for i, f in enumerate(unwrap(ds.get("images")) if ds else [] or [], 1):
+            splash_imgs = line_spl_imgs or (unwrap(ds.get("images")) if ds else None) or []
+            for i, f in enumerate(splash_imgs, 1):
                 add(f"Cups/{ck}/{ck}_splash/{ck}_splash_{frame_num(f['name'], i)}.png", f["url"])
         elif cup:
             skips.append((f"cup '{cup.get('name')}' (line '{line.get('name')}')", "no clean cup key"))
