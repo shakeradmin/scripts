@@ -252,22 +252,21 @@ def main():
     # Persist the DB hash we've now applied, so an unchanged DB won't trigger restarts.
     save_state = f"mkdir -p $(dirname {STATE_FILE}); printf %s {cur_hash} > {STATE_FILE}; "
 
-    if assignment_changed:
-        # Rewrite config.json (assignment) then restart. kill FIRST so the app can't
-        # save its in-memory config over ours on exit. cat reads our new config on stdin.
-        payload = json.dumps(cfg, ensure_ascii=False, indent=2).encode()
-        cmd = (f"{kill}{save_state}"
-               f"cp -a {CFG_DIR}/config.json {CFG_DIR}/config.json.pre-cellsync-{ts}; "
-               f"cat > {CFG_DIR}/config.json")
-        r = ssh_run(target, cmd, args.password, input_bytes=payload)
-        note = f"config.json updated (backup .pre-cellsync-{ts})"
-    else:
-        # DB-only change: no config edit, just restart so the app reloads dataBase.json.
-        r = ssh_run(target, f"{kill}{save_state}true", args.password)
-        note = "product DB reloaded (no cell change)"
+    # Always write the reconciled config: the app does NOT repopulate a cell's
+    # components/dosage from dataBase.json on load — the container holds a snapshot
+    # until reassigned. So nutrition/dosage edits (db_changed) must be written into
+    # each kept cell's Product block, which reconcile() already rebuilt from the DB.
+    # kill FIRST so the app can't save its in-memory config over ours on exit.
+    payload = json.dumps(cfg, ensure_ascii=False, indent=2).encode()
+    cmd = (f"{kill}{save_state}"
+           f"cp -a {CFG_DIR}/config.json {CFG_DIR}/config.json.pre-cellsync-{ts}; "
+           f"cat > {CFG_DIR}/config.json")
+    r = ssh_run(target, cmd, args.password, input_bytes=payload)
     if r.returncode != 0:
         sys.exit(f"apply failed: {r.stderr.decode()[:200]}")
-    log(f"[{target}] {note}" + ("" if args.no_restart else "; app restarting"))
+    note = "assignment + product data" if assignment_changed else "product data (nutrition/dosage)"
+    log(f"[{target}] config.json updated: {note} (backup .pre-cellsync-{ts})"
+        + ("" if args.no_restart else "; app restarting"))
     return 0
 
 
