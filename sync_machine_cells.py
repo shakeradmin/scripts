@@ -31,7 +31,7 @@ USAGE
 Restart is a single-PID SIGKILL (no exit-time config save can clobber the edit);
 AppManager relaunches the app in ~15 s. NEVER pattern-kills.
 """
-import argparse, hashlib, json, os, subprocess, sys, urllib.request
+import argparse, hashlib, json, os, re, subprocess, sys, urllib.request
 
 STRAPI = os.environ.get("STRAPI_BASE_URL", "https://admin.ishaker.xyz")
 UA = "Mozilla/5.0 sync_machine_cells/1.0"
@@ -174,6 +174,102 @@ def reconcile(cfg, db, default_price):
     return cfg, placed, [t[2]["Name"] for t in remaining]
 
 
+def fetch_explicit_cells(machine_arg, ssh_target):
+    """Return the machine's explicit cell assignments from Strapi, or None.
+
+    None => Strapi unreachable / machine not identifiable => caller uses auto-assign.
+    []   => machine identified but has no machine-cell rows => caller uses auto-assign
+            (the 'Keep auto-assign' fallback). A non-empty list is AUTHORITATIVE.
+    """
+    env = load_env()
+    ident = env.get("STRAPI_MACHINE_USER_USERNAME") or env.get("STRAPI_MACHINE_USER_LOGIN")
+    try:
+        token = strapi_login(ident, env["STRAPI_MACHINE_USER_PASSWORD"])
+    except Exception:
+        return None
+    mid = None
+    try:
+        if machine_arg and str(machine_arg).isdigit():
+            mid = int(machine_arg)
+        elif machine_arg:
+            d = strapi_get(f"/api/machines?filters[serial_number][$eq]={machine_arg}"
+                           f"&fields[0]=id", token)["data"]
+            if d:
+                mid = d[0]["id"]
+        if mid is None and ssh_target:
+            ip = ssh_target.split("@")[-1]
+            d = strapi_get(f"/api/machines?filters[tailscale_ip][$eq]={ip}&fields[0]=id",
+                           token)["data"]
+            if d:
+                mid = d[0]["id"]
+        if mid is None:
+            return None
+        q = (f"/api/machine-cells?filters[machine][id][$eq]={mid}"
+             f"&populate[product][populate][taste]=*&pagination[pageSize]=200")
+        rows = strapi_get(q, token)["data"]
+    except Exception:
+        return None
+    cells = []
+    for r in rows:
+        a = r["attributes"]
+        prod = (a.get("product") or {}).get("data")
+        names = []
+        if prod:
+            pa = prod["attributes"]
+            if pa.get("name"):
+                names.append(pa["name"])
+            t = (pa.get("taste") or {}).get("data")
+            if t and t["attributes"].get("name"):
+                names.append(t["attributes"]["name"])
+        cells.append({"position": a["position"], "active": bool(a.get("isActive", True)),
+                      "category": a.get("cell_category"), "taste_names": names})
+    return cells
+
+
+def reconcile_explicit(cfg, db, cells, default_price):
+    """AUTHORITATIVE reconcile: containers follow the Strapi machine-cell rows exactly.
+
+    Matched by physical container number == cell.position.
+      * product set + active  -> rebuild that container's Product block from the DB taste
+        (keeps existing dPrices), IsActive=True.
+      * product null / inactive -> IsActive=False (client emptied the slot).
+      * product assigned but not yet in the machine DB (catalog lag) -> left untouched,
+        reported as 'missing'; the next run places it once FleetCatalog syncs the DB.
+      * a physical container with NO cell row -> left untouched (not yet seeded).
+    """
+    containers = cfg.get("Containers", [])
+    # Match on a normalized key: the machine DB stores taste names as slugs
+    # ('chocolate-hazelnut') while Strapi carries display names ('Chocolate Hazelnut').
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+    by_name = {norm(t[2]["Name"]): t for t in db_tastes(db)}
+    cellmap = {c["position"]: c for c in cells}
+    placed, missing, cleared = [], [], []
+    for c in containers:
+        pos = c.get("ContainerNumber")
+        spec = cellmap.get(pos)
+        if spec is None:
+            continue  # unseeded physical container — leave as-is
+        names = spec["taste_names"]
+        if not spec["active"] or not names:
+            if c.get("IsActive"):
+                c["IsActive"] = False
+                cleared.append(pos)
+            continue
+        match = next((by_name[norm(n)] for n in names if norm(n) in by_name), None)
+        if not match:
+            missing.append((pos, names))
+            continue  # catalog lag — never wipe the cell
+        company, product, taste = match
+        dprices = (c.get("Product") or {}).get("dPrices") or [
+            {"Volume": taste["Dosage"]["DrinkVolume"], "Price": default_price}]
+        c["Product"] = build_product_block(company, product, taste, dprices)
+        c["Cup"] = dict(product["Cup"])
+        c["IsActive"] = True
+        placed.append((pos, taste["Name"]))
+    cfg["Containers"] = containers
+    return cfg, placed, missing, cleared
+
+
 def assign_sig(containers):
     """Semantic signature of cell assignment: (cell, active, taste id) per container.
     Ignores JSON formatting and the component/dosage fields the APP rewrites on save."""
@@ -217,7 +313,21 @@ def main():
     before_sig = assign_sig(cfg.get("Containers", []))
     before_cells = [(c["ContainerNumber"], (((c.get("Product") or {}).get("Taste") or {}).get("Name")),
                      c.get("IsActive")) for c in cfg.get("Containers", [])]
-    cfg, placed, leftover = reconcile(cfg, db, args.default_price)
+
+    # Explicit machine-cell rows in Strapi are authoritative; absent them, auto-assign.
+    cells = fetch_explicit_cells(args.machine, target)
+    if cells:
+        cfg, placed, missing, cleared = reconcile_explicit(cfg, db, cells, args.default_price)
+        mode, leftover = "explicit", []
+        if missing:
+            log(f"[{target}] {len(missing)} assigned product(s) not in machine DB yet "
+                f"(catalog lag, cells untouched): {missing}")
+        if cleared:
+            log(f"[{target}] {len(cleared)} cell(s) emptied by client: positions {cleared}")
+    else:
+        cfg, placed, leftover = reconcile(cfg, db, args.default_price)
+        mode = "auto"
+    log(f"[{target}] mode={mode}")
     after_sig = assign_sig(cfg["Containers"])
     after_cells = [(c["ContainerNumber"], c["Product"]["Taste"]["Name"], c["IsActive"])
                    for c in cfg["Containers"]]
