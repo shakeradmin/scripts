@@ -1186,11 +1186,24 @@ PY
 # Echoes the HTTP status. 200 and 404 both mean AUTHENTICATED: 404 is the normal answer for
 # a freshly bootstrapped machine that has no product lines or cells yet. Only 401/403 mean
 # the credential itself was rejected.
+# Retries, because at this point in bootstrap the Tailscale route to the Strapi box is
+# often still settling: machine 78 (260511736) probed both credentials, got a connect
+# timeout on each, and fell through to the unverified branch — which then wrote a token
+# the server rejects. A transient network state must not decide which credential ships.
 probe_catalog_credential() {
-  local serial="$1" token="$2" code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
-    -H "Authorization: Bearer $token" \
-    "$FLEET_CATALOG_URL/api/machines/$serial/catalog" 2>/dev/null || echo 000)"
+  local serial="$1" token="$2" code attempt
+  for attempt in 1 2 3 4 5; do
+    # curl prints "000" itself on failure AND exits non-zero, so a `|| echo 000` here
+    # concatenates into "000000" and matches no case branch. Swallow the exit code instead.
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+      -H "Authorization: Bearer $token" \
+      "$FLEET_CATALOG_URL/api/machines/$serial/catalog" 2>/dev/null)" || true
+    [ -n "$code" ] || code=000
+    if [ "$code" != "000" ]; then break; fi
+    # `cmd && sleep` as the last statement would leave the loop with status 1 on the final
+    # attempt, and this script runs under `set -e`.
+    if [ "$attempt" -lt 5 ]; then sleep 10; fi
+  done
   printf '%s' "$code"
 }
 
@@ -1232,12 +1245,22 @@ write_fleet_json() {
     done
   fi
 
-  # Could not prove any of them (server down, or nothing accepted). Write the preferred one
-  # anyway: an unverified file the operator can see beats no file at all, and the machine
-  # retries every refresh_minutes regardless.
+  # Could not prove any of them (server down, or nothing accepted). Write one anyway: an
+  # unverified file the operator can see beats no file at all, and the machine retries every
+  # refresh_minutes regardless.
+  #
+  # When guessing, pick the SHARED CATALOG_TOKEN, not the machine secret. Per-machine secret
+  # auth exists only on the dev Strapi (commit dc6915f) and is not deployed to prod, so the
+  # secret is the one credential guaranteed to fail today, while the shared token is the one
+  # every running server accepts. The secret still wins whenever the probe actually proves it,
+  # so this fallback expires by itself once per-machine auth ships.
   if [ -z "$fleet_token" ]; then
-    fleet_token="${candidates[0]}"; chosen_label="${labels[0]} (UNVERIFIED)"
-    record_warning "Could not verify any catalog credential against $FLEET_CATALOG_URL — writing fleet.json with ${labels[0]}; if the machine logs 401, the server does not accept it yet"
+    local pick=0 j
+    for j in "${!labels[@]}"; do
+      if [ "${labels[$j]}" = "shared CATALOG_TOKEN" ]; then pick="$j"; break; fi
+    done
+    fleet_token="${candidates[$pick]}"; chosen_label="${labels[$pick]} (UNVERIFIED)"
+    record_warning "Could not verify any catalog credential against $FLEET_CATALOG_URL — writing fleet.json with ${labels[$pick]} (the credential every server version accepts); if the machine logs 401, check $FLEET_CATALOG_URL is reachable from the machine"
   fi
 
   local found=0
