@@ -793,9 +793,9 @@ curl_json_logged() {
 }
 
 load_creds_from_strapi() {
-  local token creds_json ts_key anydesk_password rustdesk_password telemetry_password
+  local token creds_json ts_key anydesk_password rustdesk_password telemetry_password catalog_token
 
-  log "Fetching TS_KEY/ANYDESK_PASSWORD/RUSTDESK_PASSWORD/TELEMETRY_PASSWORD from Strapi cred entity"
+  log "Fetching TS_KEY/ANYDESK_PASSWORD/RUSTDESK_PASSWORD/TELEMETRY_PASSWORD/CATALOG_TOKEN from Strapi cred entity"
   token="$(strapi_token)"
   creds_json="$(curl_json_logged GET "$STRAPI_BASE_URL/api/cred" "$token")" || {
     log "ERROR: failed to fetch Strapi cred entity"
@@ -806,6 +806,7 @@ load_creds_from_strapi() {
   anydesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("ANYDESK_PASSWORD") or "")')"
   rustdesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("RUSTDESK_PASSWORD") or "")')"
   telemetry_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("TELEMETRY_PASSWORD") or "")')"
+  catalog_token="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("CATALOG_TOKEN") or "")')"
 
   if [ -z "$TAILSCALE_AUTHKEY" ] && [ -n "$ts_key" ]; then
     TAILSCALE_AUTHKEY="$ts_key"
@@ -825,6 +826,15 @@ load_creds_from_strapi() {
   if [ -z "$MANAGE_PASSWORD" ] && [ -n "$telemetry_password" ]; then
     MANAGE_PASSWORD="$telemetry_password"
     log "Loaded MANAGE_PASSWORD (TELEMETRY_PASSWORD) from Strapi cred entity"
+  fi
+
+  # Same treatment as every other secret: an operator should never have to paste this
+  # into a per-machine .env. Without it write_fleet_json() skips, and the machine ships
+  # unable to pull its catalog or planogram -- which is exactly what happened on the
+  # 2026-07-28 rebuild of serial 004.
+  if [ -z "$FLEET_CATALOG_TOKEN" ] && [ -n "$catalog_token" ]; then
+    FLEET_CATALOG_TOKEN="$catalog_token"
+    log "Loaded FLEET_CATALOG_TOKEN (CATALOG_TOKEN) from Strapi cred entity"
   fi
 }
 
