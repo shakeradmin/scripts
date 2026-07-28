@@ -1134,23 +1134,64 @@ PY
 # fleet-wide (url + shared token + interval). Everything machine-specific -- which products,
 # which container, prices -- is resolved server-side from the serial, so this file never has
 # to be regenerated when the client changes anything.
+# Probe the live catalog endpoint with a candidate credential.
+# Echoes the HTTP status. 200 and 404 both mean AUTHENTICATED: 404 is the normal answer for
+# a freshly bootstrapped machine that has no product lines or cells yet. Only 401/403 mean
+# the credential itself was rejected.
+probe_catalog_credential() {
+  local serial="$1" token="$2" code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H "Authorization: Bearer $token" \
+    "$FLEET_CATALOG_URL/api/machines/$serial/catalog" 2>/dev/null || echo 000)"
+  printf '%s' "$code"
+}
+
+# Write Config/fleet.json with a credential PROVEN to work against the server that is
+# actually running.
+#
+# Two credentials can be valid: this machine's own secret (preferred — nothing to
+# distribute, and a leak exposes one machine instead of the fleet) and the shared
+# CATALOG_TOKEN (older servers only know this one). Rather than assume which the server
+# supports, try them in order and keep the first that authenticates. That is what makes
+# bootstrap work out of the box against either server version.
 write_fleet_json() {
   log_section "Write FleetCatalog config (Config/fleet.json)"
-  local fleet_token="${1:-}"
-  # Prefer THIS machine's own secret (registered as machine.secret at registration, and
-  # accepted by the catalog/planogram endpoints). It needs no distribution and no operator
-  # step, and a leak exposes one machine instead of the whole fleet. FLEET_CATALOG_TOKEN
-  # stays as a fallback for older servers that only know the shared token.
-  if [ -z "$fleet_token" ]; then
-    fleet_token="$FLEET_CATALOG_TOKEN"
-    log "Using shared FLEET_CATALOG_TOKEN (no per-machine secret available)"
-  else
-    log "Using this machine's own secret as the catalog credential"
-  fi
-  if [ -z "$fleet_token" ]; then
+  local machine_secret="${1:-}" serial="${2:-}"
+
+  local -a candidates=() labels=()
+  [ -n "$machine_secret" ] && { candidates+=("$machine_secret"); labels+=("this machine's own secret"); }
+  [ -n "$FLEET_CATALOG_TOKEN" ] && { candidates+=("$FLEET_CATALOG_TOKEN"); labels+=("shared CATALOG_TOKEN"); }
+
+  if [ "${#candidates[@]}" -eq 0 ]; then
     record_warning "No catalog credential (neither machine secret nor CATALOG_TOKEN) — fleet.json NOT written; the machine will not pull catalog or planogram"
     return 0
   fi
+
+  local fleet_token="" chosen_label="" i code
+  if [ -n "$serial" ]; then
+    for i in "${!candidates[@]}"; do
+      code="$(probe_catalog_credential "$serial" "${candidates[$i]}")"
+      case "$code" in
+        200|404)
+          fleet_token="${candidates[$i]}"; chosen_label="${labels[$i]}"
+          log "Catalog credential verified: ${labels[$i]} (HTTP $code$([ "$code" = 404 ] && echo ' — authenticated, no catalog configured yet'))"
+          break ;;
+        401|403)
+          log "Catalog credential rejected: ${labels[$i]} (HTTP $code) — trying next" ;;
+        *)
+          log "Catalog endpoint unreachable while testing ${labels[$i]} (HTTP $code)" ;;
+      esac
+    done
+  fi
+
+  # Could not prove any of them (server down, or nothing accepted). Write the preferred one
+  # anyway: an unverified file the operator can see beats no file at all, and the machine
+  # retries every refresh_minutes regardless.
+  if [ -z "$fleet_token" ]; then
+    fleet_token="${candidates[0]}"; chosen_label="${labels[0]} (UNVERIFIED)"
+    record_warning "Could not verify any catalog credential against $FLEET_CATALOG_URL — writing fleet.json with ${labels[0]}; if the machine logs 401, the server does not accept it yet"
+  fi
+
   local found=0
   for cfg in /home/*/ShakerView2.0Linux*/ShakerView2.0_Data/Config; do
     [ -d "$cfg" ] || continue
@@ -1170,7 +1211,7 @@ write_fleet_json() {
 EOF
     chown "$owner":"$owner" "$cfg/fleet.json" 2>/dev/null || true
     chmod 600 "$cfg/fleet.json"
-    log "fleet.json written to $cfg (url=$FLEET_CATALOG_URL refresh=${FLEET_REFRESH_MINUTES}m)"
+    log "fleet.json written to $cfg (credential: $chosen_label, url=$FLEET_CATALOG_URL, refresh=${FLEET_REFRESH_MINUTES}m)"
   done
   if [ "$found" = "0" ]; then
     record_warning "No ShakerView Config directory found — fleet.json not written"
@@ -1421,7 +1462,7 @@ main() {
   # server has stored it, and the file must be written even when telemetry registration
   # failed — the catalog path does not depend on telemetry at all.
   if [ -n "$machine_id" ]; then
-    write_fleet_json "$machine_secret"
+    write_fleet_json "$machine_secret" "$serial_number"
   else
     record_warning "Strapi registration produced no machine id — fleet.json NOT written (its secret would not authenticate)"
   fi
