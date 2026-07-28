@@ -32,6 +32,12 @@ UNITY_VERSION="${UNITY_VERSION:-}"
 SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
 MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
+# FleetCatalog (Config/fleet.json): the machine PULLS its catalog + planogram from Strapi.
+# Tailscale-direct on purpose — admin.ishaker.xyz sits behind Cloudflare, which 403s the
+# app's user-agent (error 1010). CATALOG_TOKEN is the shared bearer the endpoints check.
+FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
+FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
+FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
 MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
 # Realm the MACHINE authenticates against (client_credentials, client_id == its serial). Used to
 # VERIFY that telemetry registration produced credentials ShakerView can actually authenticate with.
@@ -1114,6 +1120,42 @@ PY
 # MachineSerial MUST be set to that same serial — otherwise ShakerView presents a stale/mismatched
 # client_id and gets 401 unauthorized_client. This is exactly what breaks cloned goldens that keep the
 # master's MachineSerial (e.g. MS-25081725). scrub_clone_identity() clears the master's KEY but not this.
+# fleet.json is per-machine only in that it lives on the machine: the CONTENT is identical
+# fleet-wide (url + shared token + interval). Everything machine-specific -- which products,
+# which container, prices -- is resolved server-side from the serial, so this file never has
+# to be regenerated when the client changes anything.
+write_fleet_json() {
+  log_section "Write FleetCatalog config (Config/fleet.json)"
+  if [ -z "$FLEET_CATALOG_TOKEN" ]; then
+    record_warning "FLEET_CATALOG_TOKEN/CATALOG_TOKEN not set — fleet.json NOT written; the machine will not pull catalog or planogram"
+    return 0
+  fi
+  local found=0
+  for cfg in /home/*/ShakerView2.0Linux*/ShakerView2.0_Data/Config; do
+    [ -d "$cfg" ] || continue
+    found=1
+    local owner
+    owner="$(stat -c %U "$cfg" 2>/dev/null || echo shaker)"
+    [ -f "$cfg/fleet.json" ] && cp -a "$cfg/fleet.json" "$cfg/fleet.json.bak-$(date +%Y%m%d-%H%M%S)"
+    cat >"$cfg/fleet.json" <<EOF
+{
+  "enabled": true,
+  "catalog": true,
+  "planogram": true,
+  "url": "$FLEET_CATALOG_URL",
+  "token": "$FLEET_CATALOG_TOKEN",
+  "refresh_minutes": $FLEET_REFRESH_MINUTES
+}
+EOF
+    chown "$owner":"$owner" "$cfg/fleet.json" 2>/dev/null || true
+    chmod 600 "$cfg/fleet.json"
+    log "fleet.json written to $cfg (url=$FLEET_CATALOG_URL refresh=${FLEET_REFRESH_MINUTES}m)"
+  done
+  if [ "$found" = "0" ]; then
+    record_warning "No ShakerView Config directory found — fleet.json not written"
+  fi
+}
+
 apply_hard_settings_serial() {
   log_section "Align on-device hard_settings MachineSerial with registered serial"
   local serial_number="$1"
@@ -1349,6 +1391,7 @@ main() {
       # Registration mints a Keycloak client id == serial_number; point ShakerView's client_id
       # (hard_settings.MachineSerial) at it, then prove the pair actually authenticates.
       apply_hard_settings_serial "$serial_number"
+      write_fleet_json
       verify_telemetry_auth "$serial_number" "$machine_key" || true
     fi
   fi
