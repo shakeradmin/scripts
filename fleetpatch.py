@@ -227,11 +227,26 @@ def kiosk_idle(target):
         rc, out = ssh(target, f"grep -a 'heartbeat' {DIAG} | tail -1")
         if rc != 0:
             return False, "no patch-diag heartbeat"
-    # Attract-mode ad playback is the reliable 'nobody is here' marker in Player.log.
-    rc, tail = ssh(target, f"tail -40 {PLAYER_LOG} | grep -c 'Play ad' || true")
+    # The app logs "CurrentScreen = X" on every navigation, so the LAST one states exactly
+    # where the kiosk is standing. StartScreen is the attract screen: nobody is buying.
+    #
+    # This replaces a `tail -40 | grep 'Play ad'` window count, which called an idle machine
+    # busy: a payment terminal polls constantly ("PaymentSystemsExist ..."), so on any
+    # machine with a terminal attached the ad lines are pushed out of a 40-line tail within
+    # seconds. Machine 79 sat on StartScreen and was refused as "in use".
+    rc, screen = ssh(target, f"grep -ao 'CurrentScreen = [A-Za-z]*' {PLAYER_LOG} | tail -1")
+    screen = (screen or "").split("=")[-1].strip()
+    if screen:
+        if screen == "StartScreen":
+            return True, "idle (StartScreen)"
+        return False, f"kiosk in use (CurrentScreen = {screen})"
+
+    # No screen ever logged — fall back to the old attract-frame check rather than
+    # assuming idle, because "we cannot tell" must never mean "go ahead and restart".
+    rc, tail = ssh(target, f"tail -200 {PLAYER_LOG} | grep -c 'Play ad' || true")
     if rc == 0 and tail.strip().isdigit() and int(tail.strip()) > 0:
         return True, "idle (attract screen)"
-    return False, "kiosk appears in use (no recent attract-screen frames)"
+    return False, "cannot tell whether the kiosk is in use (no CurrentScreen, no attract frames)"
 
 
 def verify(target, want_md5):
