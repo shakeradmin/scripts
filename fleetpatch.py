@@ -96,6 +96,15 @@ def ssh(target, cmd, timeout=SSH_TIMEOUT):
             ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
              "-o", f"ConnectTimeout={min(timeout, 15)}", target, cmd],
             capture_output=True, text=True, timeout=timeout + 15)
+        # stdout ONLY on success. Merging stderr poisons every value this function is
+        # parsed for: on the first ever connection to a machine ssh writes "Warning:
+        # Permanently added '<ip>' to the list of known hosts." to stderr, so `live`
+        # became the md5 PLUS that sentence and matched no accepted base — machine 79
+        # (260511735) was skipped as "not an accepted base" while holding a listed one.
+        # Every brand-new machine hits this exactly once, which is the worst possible
+        # timing. On failure the merge stays: that is where the diagnostic text lives.
+        if r.returncode == 0:
+            return 0, r.stdout.strip()
         return r.returncode, (r.stdout + r.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, "ssh timed out"
