@@ -1136,8 +1136,19 @@ PY
 # to be regenerated when the client changes anything.
 write_fleet_json() {
   log_section "Write FleetCatalog config (Config/fleet.json)"
-  if [ -z "$FLEET_CATALOG_TOKEN" ]; then
-    record_warning "FLEET_CATALOG_TOKEN/CATALOG_TOKEN not set — fleet.json NOT written; the machine will not pull catalog or planogram"
+  local fleet_token="${1:-}"
+  # Prefer THIS machine's own secret (registered as machine.secret at registration, and
+  # accepted by the catalog/planogram endpoints). It needs no distribution and no operator
+  # step, and a leak exposes one machine instead of the whole fleet. FLEET_CATALOG_TOKEN
+  # stays as a fallback for older servers that only know the shared token.
+  if [ -z "$fleet_token" ]; then
+    fleet_token="$FLEET_CATALOG_TOKEN"
+    log "Using shared FLEET_CATALOG_TOKEN (no per-machine secret available)"
+  else
+    log "Using this machine's own secret as the catalog credential"
+  fi
+  if [ -z "$fleet_token" ]; then
+    record_warning "No catalog credential (neither machine secret nor CATALOG_TOKEN) — fleet.json NOT written; the machine will not pull catalog or planogram"
     return 0
   fi
   local found=0
@@ -1153,7 +1164,7 @@ write_fleet_json() {
   "catalog": true,
   "planogram": true,
   "url": "$FLEET_CATALOG_URL",
-  "token": "$FLEET_CATALOG_TOKEN",
+  "token": "$fleet_token",
   "refresh_minutes": $FLEET_REFRESH_MINUTES
 }
 EOF
@@ -1401,7 +1412,7 @@ main() {
       # Registration mints a Keycloak client id == serial_number; point ShakerView's client_id
       # (hard_settings.MachineSerial) at it, then prove the pair actually authenticates.
       apply_hard_settings_serial "$serial_number"
-      write_fleet_json
+      write_fleet_json "$machine_secret"
       verify_telemetry_auth "$serial_number" "$machine_key" || true
     fi
   fi
