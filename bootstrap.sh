@@ -1412,11 +1412,19 @@ main() {
       # Registration mints a Keycloak client id == serial_number; point ShakerView's client_id
       # (hard_settings.MachineSerial) at it, then prove the pair actually authenticates.
       apply_hard_settings_serial "$serial_number"
-      write_fleet_json "$machine_secret"
       verify_telemetry_auth "$serial_number" "$machine_key" || true
     fi
   fi
   machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret")"
+
+  # Unconditional and AFTER registration: the secret in this file is only valid once the
+  # server has stored it, and the file must be written even when telemetry registration
+  # failed — the catalog path does not depend on telemetry at all.
+  if [ -n "$machine_id" ]; then
+    write_fleet_json "$machine_secret"
+  else
+    record_warning "Strapi registration produced no machine id — fleet.json NOT written (its secret would not authenticate)"
+  fi
 
   write_credentials_file "$machine_id" "$serial_number" "$anydesk_id" "$tailscale_ip" "$tailscale_hostname" "$rustdesk_id" "$reg_code" "$machine_secret"
   if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
