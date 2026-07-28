@@ -18,10 +18,14 @@ Per machine, per cycle:
      content hash, so URL set == content set). Manifest changed → stage + push via
      load_product_media.py (tar over ssh), remember restart is needed.
      First-ever run pushes but does NOT restart (baseline).
-  3. cells    — sync_machine_cells.py (writes reconciled config + restarts by itself
-     when DB/assignment changed).
-  4. restart  — if media changed but cells didn't restart: canonical single-PID kill
-     (AppManager relaunches in ~15 s). NEVER pattern-kills.
+  3. cells    — NOT handled here. The machine pulls its planogram from Strapi itself
+     (/api/machines/<serial>/planogram, 5 min). Pushing cells from here too would put
+     two writers on config.json. Left in the status line as a marker only.
+  4. restart  — if media changed: canonical single-PID kill (AppManager relaunches in
+     ~15 s). NEVER pattern-kills.
+
+NOT here either: patch rollout. That is fleetpatch.py — a health sweep that also swaps
+binaries is a sweep you stop trusting.
 
 State: ~/fleetpulse/state/<machine-id>/ (media manifest, staging).
 Log:   one summary line per swept machine on stdout; cron wrapper filters idle lines.
@@ -41,6 +45,10 @@ MIN_PATCH_ID = 4
 SSH_TIMEOUT = 10
 STRAPI = os.environ.get("STRAPI_BASE_URL", "http://localhost:1338")
 UA = "fleetpulse/1.0"
+# Machines pull over Tailscale-direct: admin.ishaker.xyz is behind Cloudflare, which 403s
+# non-browser user agents. Check against the same URL the machine itself uses.
+FLEET_URL = os.environ.get("FLEET_CATALOG_URL", "http://100.101.29.104:1338")
+MEDIA = "~/ShakerView2.0Linux/ShakerView2.0_Data/Media"
 
 # Reuse load_product_media's Strapi helpers + media collection (same key derivation
 # as the catalog controller). Import by path: the script has a __main__ guard.
@@ -122,6 +130,87 @@ def media_manifest(token, machine_id):
     return hashlib.md5(blob).hexdigest(), items
 
 
+def catalog_token(token):
+    """Shared catalog bearer, read from the Strapi cred entity (same place bootstrap gets it)."""
+    try:
+        creds = (lpm.api("/api/cred", token)["data"]["attributes"] or {}).get("creds") or {}
+        return creds.get("CATALOG_TOKEN") or ""
+    except Exception:
+        return ""
+
+
+def _served_keys(serial, ctoken):
+    """Media keys the machine will actually ASK for, taken from what the server serves.
+
+    Deriving them here rather than from Strapi relations means we check exactly what the
+    endpoints produce — the same strings that end up in Container.Product.Taste.mediaKey.
+    """
+    keys = {"tastes": set(), "cups": set(), "brands": set()}
+    for ep in ("catalog", "planogram"):
+        req = urllib.request.Request(f"{FLEET_URL}/api/machines/{serial}/{ep}",
+                                     headers={"Authorization": f"Bearer {ctoken}", "User-Agent": UA})
+        try:
+            d = json.load(urllib.request.urlopen(req, timeout=25))
+        except Exception:
+            continue                      # 404 = nothing configured yet; not a media fault
+        if ep == "catalog":
+            for b in d.get("body") or []:
+                if b.get("mediaKey"):
+                    keys["brands"].add(b["mediaKey"])
+                for line in b.get("ingredientLines") or []:
+                    for i in line.get("ingredients") or []:
+                        if i.get("mediaKey"):
+                            keys["tastes"].add(i["mediaKey"])
+                        if (i.get("view") or {}).get("name"):
+                            keys["cups"].add(i["view"]["name"])
+        else:
+            body = d.get("body") or {}
+            for pr in body.get("products") or []:
+                if (pr.get("taste") or {}).get("name"):
+                    keys["tastes"].add(pr["taste"]["name"])   # consumed as MediaKey
+                if (pr.get("sportPit") or {}).get("name"):
+                    keys["cups"].add(pr["sportPit"]["name"])
+                if (pr.get("brand") or {}).get("mediaKey"):
+                    keys["brands"].add(pr["brand"]["mediaKey"])
+    return keys
+
+
+def check_media_keys(target, serial, ctoken):
+    """Every key the server serves must resolve to a file on the machine.
+
+    A missing one is invisible until somebody looks at the kiosk and sees a blank tile —
+    exactly how the mango-peach case was found. One ls of three directories catches it.
+    """
+    if not ctoken:
+        return {"error": "no CATALOG_TOKEN in cred"}, []
+    keys = _served_keys(serial, ctoken)
+    if not any(keys.values()):
+        return {"checked": 0}, []
+    rc, out = ssh_run(target, f"ls {MEDIA}/Tastes; echo ---; ls {MEDIA}/Cups; echo ---; ls {MEDIA}/CompanyLogos")
+    if rc != 0:
+        return {"error": "could not list Media/"}, []
+    parts = out.split("---")
+    have_t = set(parts[0].split())
+    have_c = set(parts[1].split()) if len(parts) > 1 else set()
+    have_l = set(x[:-len("-logo.png")] for x in parts[2].split() if x.endswith("-logo.png")) if len(parts) > 2 else set()
+
+    missing = []
+    for k in sorted(keys["tastes"]):
+        if k not in have_t:
+            missing.append(f"taste:{k}")
+    for k in sorted(keys["cups"]):
+        if k not in have_c:
+            missing.append(f"cup:{k}")
+    for k in sorted(keys["brands"]):
+        if k not in have_l:
+            missing.append(f"brand:{k}")
+
+    st = {"checked": sum(len(v) for v in keys.values()), "missing": missing}
+    notes = [f"MEDIA MISSING on machine: {', '.join(missing[:6])}"
+             + (f" (+{len(missing)-6} more)" if len(missing) > 6 else "")] if missing else []
+    return st, notes
+
+
 def sweep_machine(m, token, dry_run=False, verbose=False):
     mdir = os.path.join(STATE_ROOT, str(m["id"]))
     os.makedirs(mdir, exist_ok=True)
@@ -169,25 +258,24 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
         status["media"] = {"error": str(e)[:200]}
         notes.append(f"ERROR: media manifest: {e}")
 
-    # 3) cells (sync restarts by itself when config changes)
+    # 2b) media keys actually resolve on the machine
+    try:
+        st, ns = check_media_keys(target, m["serial"], m.get("ctoken") or "")
+        status["media_keys"] = st
+        notes += ns
+    except Exception as e:
+        status["media_keys"] = {"error": str(e)[:200]}
+
+    # 3) cells — NOT OURS ANY MORE (2026-07-28).
+    # sync_machine_cells.py used to reconcile config.json Containers by auto-placing
+    # database tastes into free cells. The machine now PULLS its planogram from
+    # /api/machines/<serial>/planogram every 5 min and writes the same file itself, so
+    # running the old push here means two writers racing over config.json — the pushed
+    # layout would be silently reverted on the next pull, or worse, interleave with it.
+    # Cell assignment is explicit operator data (machine-cell) served by that endpoint;
+    # FleetPulse must not second-guess it.
     cells_restarted = False
-    if not dry_run:
-        r = subprocess.run(
-            [sys.executable, os.path.join(SCRIPTS, "sync_machine_cells.py"),
-             "--machine", str(m["id"])],
-            capture_output=True, text=True, timeout=300,
-            env={**os.environ, "STRAPI_BASE_URL": STRAPI})
-        cells_out = (r.stdout + r.stderr).strip()
-        if "no change" in cells_out:
-            status["cells"] = "no change"
-        else:
-            status["cells"] = cells_out[-300:]
-            cells_restarted = r.returncode == 0
-            notes.append("cells: " + cells_out.splitlines()[-1][:120] if cells_out else "cells synced")
-        if r.returncode != 0:
-            notes.append("ERROR: cell sync failed")
-    else:
-        status["cells"] = "dry-run"
+    status["cells"] = "owned by /planogram (pull)"
 
     # 4) restart for media-only changes
     if restart_needed and not cells_restarted and not dry_run:
@@ -212,7 +300,12 @@ def main():
     ident = env.get("STRAPI_MACHINE_USER_USERNAME") or env.get("STRAPI_MACHINE_USER_LOGIN")
     token = lpm.strapi_login(ident, env["STRAPI_MACHINE_USER_PASSWORD"])
 
+    ctoken = catalog_token(token)
+    if not ctoken:
+        print("WARN: no CATALOG_TOKEN in the Strapi cred entity — media-key check disabled")
     machines = select_machines(token)
+    for _m in machines:
+        _m["ctoken"] = ctoken
     if args.machine:
         machines = [m for m in machines if str(m["id"]) == args.machine]
         if not machines:
@@ -227,8 +320,8 @@ def main():
             except Exception as e:
                 notes.append(f"WARN: fleet_status write failed: {e}")
         idle = (status.get("sweep") == "ok" and not notes
-                and status.get("cells") == "no change"
-                and not (status.get("media") or {}).get("changed"))
+                and not (status.get("media") or {}).get("changed")
+                and not (status.get("media_keys") or {}).get("missing"))
         line = (f"machine {m['id']} ({m['serial']}): sweep={status.get('sweep')} "
                 f"app={'up' if status.get('app_pid') else 'DOWN'} "
                 f"ws={status.get('telemetry_ws')} cat={status.get('catalog_md5')}"

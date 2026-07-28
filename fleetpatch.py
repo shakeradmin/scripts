@@ -85,11 +85,22 @@ def log(msg):
 
 
 def ssh(target, cmd, timeout=SSH_TIMEOUT):
-    r = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
-         "-o", f"ConnectTimeout={min(timeout, 15)}", target, cmd],
-        capture_output=True, text=True, timeout=timeout + 15)
-    return r.returncode, (r.stdout + r.stderr).strip()
+    """Never raises. A slow or wedged machine must be reported, not crash the run.
+
+    subprocess.run(timeout=) raises TimeoutExpired; uncaught, one unresponsive machine
+    aborted the whole sweep with a traceback and stopped the rollout for every machine
+    behind it.
+    """
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+             "-o", f"ConnectTimeout={min(timeout, 15)}", target, cmd],
+            capture_output=True, text=True, timeout=timeout + 15)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "ssh timed out"
+    except Exception as e:
+        return 125, f"ssh failed: {e}"
 
 
 def api(path, token):
@@ -237,6 +248,7 @@ def verify(target, want_md5):
 
 
 def install(machine, patch, artifact, dry_run, force):
+    # Everything below tolerates ssh() returning a non-zero rc instead of raising.
     target = f"{machine['user']}@{machine['ip']}"
     want = first_md5(patch["attributes"].get("patched_md5"))
     base = first_md5(patch["attributes"].get("base_md5"))
@@ -351,7 +363,12 @@ def main():
             log(f"ABORT: artifact {artifact} does not match patched_md5 {want}")
             return
 
-        state, msg = install(m, p, artifact, args.dry_run, args.force)
+        try:
+            state, msg = install(m, p, artifact, args.dry_run, args.force)
+        except Exception as e:
+            # One machine must never take the sweep down. Treated as a skip, not a
+            # failure: nothing was installed, so there is nothing to abort the run over.
+            state, msg = "skip", f"machine {m['id']} ({m['serial']}): unexpected error, skipped — {e}"
         log(msg)
 
         if state == "fail":
