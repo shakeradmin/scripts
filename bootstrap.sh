@@ -149,6 +149,11 @@ load_env() {
   SSD_VERSION="${SSD_VERSION:-}"
   BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
   MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
+  # MUST be re-defaulted here, not only at the top of the script: the top-level assignment
+  # runs before .env is sourced, so CATALOG_TOKEN placed in .env would never reach it.
+  FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
+  FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
+  FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
   MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
   MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
   MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
