@@ -38,6 +38,7 @@ MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
 FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
 FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
 FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
+OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}"
 MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
 # Realm the MACHINE authenticates against (client_credentials, client_id == its serial). Used to
 # VERIFY that telemetry registration produced credentials ShakerView can actually authenticate with.
@@ -154,6 +155,7 @@ load_env() {
   FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
   FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
   FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
+  OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}"
   MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
   MANAGE_CLIENT_ID="${MANAGE_CLIENT_ID:-shaker-client}"
   MANAGE_USERNAME="${MANAGE_USERNAME:-root}"
@@ -798,7 +800,7 @@ curl_json_logged() {
 }
 
 load_creds_from_strapi() {
-  local token creds_json ts_key anydesk_password rustdesk_password telemetry_password catalog_token
+  local token creds_json ts_key anydesk_password rustdesk_password telemetry_password catalog_token ops_pubkey
 
   log "Fetching TS_KEY/ANYDESK_PASSWORD/RUSTDESK_PASSWORD/TELEMETRY_PASSWORD/CATALOG_TOKEN from Strapi cred entity"
   token="$(strapi_token)"
@@ -812,6 +814,7 @@ load_creds_from_strapi() {
   rustdesk_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("RUSTDESK_PASSWORD") or "")')"
   telemetry_password="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("TELEMETRY_PASSWORD") or "")')"
   catalog_token="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("CATALOG_TOKEN") or "")')"
+  ops_pubkey="$(echo "$creds_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((((d.get("data") or {}).get("attributes") or {}).get("creds") or {}).get("OPS_SSH_PUBKEY") or "")')"
 
   if [ -z "$TAILSCALE_AUTHKEY" ] && [ -n "$ts_key" ]; then
     TAILSCALE_AUTHKEY="$ts_key"
@@ -841,6 +844,46 @@ load_creds_from_strapi() {
     FLEET_CATALOG_TOKEN="$catalog_token"
     log "Loaded FLEET_CATALOG_TOKEN (CATALOG_TOKEN) from Strapi cred entity"
   fi
+
+  if [ -z "$OPS_SSH_PUBKEY" ] && [ -n "$ops_pubkey" ]; then
+    OPS_SSH_PUBKEY="$ops_pubkey"
+    log "Loaded OPS_SSH_PUBKEY from Strapi cred entity"
+  fi
+}
+
+# Install the ops public key so the fleet tooling can reach this machine.
+#
+# fleetpulse.py and fleetpatch.py both connect with BatchMode=yes (no password prompt, by
+# design — an interactive prompt in a cron sweep would hang it). A machine with only
+# password auth therefore reports as "unreachable" and silently drops out of health
+# monitoring and patch rollout. Every machine bootstrapped before this needed the key
+# added by hand afterwards, which is exactly the per-machine step this removes.
+#
+# Additive: appends only if absent, never rewrites authorized_keys, and does not disturb
+# password auth.
+install_ops_ssh_key() {
+  log_section "Install ops SSH public key (fleet tooling access)"
+  if [ -z "$OPS_SSH_PUBKEY" ]; then
+    record_warning "OPS_SSH_PUBKEY not set — fleet tooling (fleetpulse/fleetpatch) will see this machine as unreachable"
+    return 0
+  fi
+  local home_dir
+  home_dir="$(getent passwd "$SSH_LOGIN_USER" | cut -d: -f6)"
+  if [ -z "$home_dir" ] || [ ! -d "$home_dir" ]; then
+    record_warning "Home directory for $SSH_LOGIN_USER not found — ops SSH key not installed"
+    return 0
+  fi
+  install -d -m 700 -o "$SSH_LOGIN_USER" -g "$SSH_LOGIN_USER" "$home_dir/.ssh"
+  local ak="$home_dir/.ssh/authorized_keys"
+  touch "$ak"
+  if grep -qF "$OPS_SSH_PUBKEY" "$ak" 2>/dev/null; then
+    log "ops SSH key already present in $ak"
+  else
+    printf '%s\n' "$OPS_SSH_PUBKEY" >>"$ak"
+    log "ops SSH key appended to $ak"
+  fi
+  chown "$SSH_LOGIN_USER":"$SSH_LOGIN_USER" "$ak"
+  chmod 600 "$ak"
 }
 
 json_payload() {
@@ -1426,6 +1469,7 @@ main() {
 
   install_base_packages
   configure_ssh
+  install_ops_ssh_key
   reinstall_anydesk
   reinstall_rustdesk || log "RustDesk setup failed — non-critical, continuing bootstrap without it"
   configure_tailscale
