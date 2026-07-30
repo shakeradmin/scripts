@@ -28,6 +28,7 @@ RUSTDESK_PASSWORD="${RUSTDESK_PASSWORD:-}"
 MACHINE_TYPE="${MACHINE_TYPE:-small}"
 MACHINE_STATUS="${MACHINE_STATUS:-new}"
 MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
+MACHINE_NICKNAME="${MACHINE_NICKNAME:-}"
 UNITY_VERSION="${UNITY_VERSION:-}"
 SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
@@ -158,6 +159,7 @@ load_env() {
   MACHINE_TYPE="${MACHINE_TYPE:-small}"
   MACHINE_STATUS="${MACHINE_STATUS:-new}"
   MACHINE_SERIAL_NUMBER="${MACHINE_SERIAL_NUMBER:-}"
+  MACHINE_NICKNAME="${MACHINE_NICKNAME:-}"
   UNITY_VERSION="${UNITY_VERSION:-}"
   SSD_VERSION="${SSD_VERSION:-}"
   BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
@@ -311,6 +313,24 @@ prompt_for_serial_number() {
   done
 
   printf "%s" "$serial"
+}
+
+# Short friendly label (Strapi machine.nickname) — purely for humans telling machines apart at a
+# glance in the dashboard; has no bearing on telemetry/Keycloak identity, unlike serial_number.
+prompt_for_nickname() {
+  local nickname=""
+
+  if [ -n "$MACHINE_NICKNAME" ]; then
+    log "Using MACHINE_NICKNAME from environment"
+    printf "%s" "$MACHINE_NICKNAME"
+    return
+  fi
+
+  while [ -z "$nickname" ]; do
+    nickname="$(read_tty "Enter machine nickname: " | xargs)"
+  done
+
+  printf "%s" "$nickname"
 }
 
 prompt_for_machine_type_id() {
@@ -909,6 +929,7 @@ json_payload() {
   REG_CODE_VALUE="$8" \
   MACHINE_KEY_VALUE="$9" \
   MACHINE_SECRET_VALUE="${10}" \
+  NICKNAME_VALUE="${11}" \
   RUSTDESK_PASSWORD_VALUE="$RUSTDESK_PASSWORD" \
   SSH_USER_VALUE="$SSH_LOGIN_USER" \
   SSH_PORT_VALUE="$SSH_PORT" \
@@ -926,6 +947,7 @@ def env_or_none(key):
 
 data = {
     "status": "new",
+    "nickname": env_or_none("NICKNAME_VALUE"),
     "anydesk_id": env_or_none("ANYDESK_ID"),
     "serial_number": os.environ["MACHINE_SERIAL"],
     "tailscale_ip": env_or_none("TAILSCALE_IP_VALUE"),
@@ -959,13 +981,14 @@ register_machine_in_strapi() {
   local reg_code="$8"
   local machine_key="$9"
   local machine_secret="${10}"
+  local nickname="${11}"
   local token payload response
 
   require_command python3
 
   token="$(strapi_token)"
 
-  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code" "$machine_key" "$machine_secret")"
+  payload="$(json_payload "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$hostname_value" "$reg_code" "$machine_key" "$machine_secret" "$nickname")"
 
   log "Creating new Strapi machine (bootstrap never edits existing machine records)"
   response="$(curl_json_logged POST "$STRAPI_BASE_URL/api/machines" "$token" "$payload")"
@@ -1582,6 +1605,7 @@ main() {
   log "MACHINE_TYPE=$MACHINE_TYPE"
   log "MACHINE_STATUS=$MACHINE_STATUS"
   log "MACHINE_SERIAL_NUMBER present: $([ -n "$MACHINE_SERIAL_NUMBER" ] && echo yes || echo no)"
+  log "MACHINE_NICKNAME present: $([ -n "$MACHINE_NICKNAME" ] && echo yes || echo no)"
   log "SSH_AUTH_MODE=$SSH_AUTH_MODE"
   log "Linux password changes: disabled"
   log "ENABLE_TAILSCALE_SSH=$ENABLE_TAILSCALE_SSH"
@@ -1595,6 +1619,8 @@ main() {
   wait_for_online
   local serial_number
   serial_number="$(prompt_for_serial_number)"
+  local nickname
+  nickname="$(prompt_for_nickname)"
   local machine_type_id
   machine_type_id="$(prompt_for_machine_type_id)"
 
@@ -1642,7 +1668,7 @@ main() {
     apply_hard_settings_serial "$serial_number"
     verify_telemetry_auth "$serial_number" "$machine_key" || true
   fi
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret")"
+  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret" "$nickname")"
 
   # Unconditional and AFTER registration: the secret in this file is only valid once the
   # server has stored it, and the file must be written even when telemetry registration
