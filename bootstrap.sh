@@ -49,6 +49,18 @@ MANAGE_PASSWORD="${MANAGE_PASSWORD:-}"
 MANAGE_ORG_ID="${MANAGE_ORG_ID:-2}"
 # Set to 1 by verify_telemetry_auth() once machine-realm auth is proven to work end-to-end.
 TELEMETRY_AUTH_VERIFIED=0
+# manage.ishakerusa.com's machine/registration/<regcode> endpoint can mint a working Keycloak
+# client (secretKey comes back, auth works) while silently failing to create the machine record
+# in the org's own machine list — see [[manage-registration-mints-keycloak-not-machine-record]].
+# Retrying with the SAME serial only ever gets a "REFRESH" of the existing (still orphaned)
+# client, never a fresh attempt. So on a confirmed silent-drop we burn that serial and retry with
+# a new one, up to this many times, instead of getting stuck re-confirming the same dead client.
+TELEMETRY_REGISTER_MAX_ATTEMPTS="${TELEMETRY_REGISTER_MAX_ATTEMPTS:-6}"
+# How long to give manage's machine-list a chance to reflect a fresh registration before deciding
+# it silently dropped it (observed: real drops never showed up even a day later, so this is just
+# slack for normal replication lag, not an attempt to wait out the actual bug).
+TELEMETRY_VERIFY_POLL_ATTEMPTS="${TELEMETRY_VERIFY_POLL_ATTEMPTS:-3}"
+TELEMETRY_VERIFY_POLL_DELAY="${TELEMETRY_VERIFY_POLL_DELAY:-5}"
 
 STRAPI_PASSWORD_FILE="$(mktemp /tmp/.bootstrap_strapi_pw.XXXXXX)"
 chmod 600 "$STRAPI_PASSWORD_FILE"
@@ -985,6 +997,41 @@ manage_token() {
   return 1
 }
 
+# The only source of truth for "did manage.ishakerusa.com actually create the machine": the same
+# list the manage dashboard/mcp_telemetry reads from. secretKey coming back from the registration
+# endpoint is NOT proof of this — see TELEMETRY_REGISTER_MAX_ATTEMPTS comment above.
+manage_machine_registered() {
+  local org_id="$1"
+  local serial_number="$2"
+  local token response_file status found
+
+  token="$(manage_token)" || return 1
+
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    "$MANAGE_API_BASE/api/telemetry-machine-control/machine/list-serial-number/$org_id" \
+    -H "Authorization: Bearer $token")"
+
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    log "WARNING: could not fetch manage machine list for org $org_id (HTTP $status) — treating as not-yet-registered"
+    rm -f "$response_file"
+    return 1
+  fi
+
+  found="$(SERIAL="$serial_number" python3 -c '
+import json, os, sys
+target = os.environ["SERIAL"]
+data = json.load(sys.stdin)
+items = data if isinstance(data, list) else data.get("data", [])
+for item in items:
+    if item.get("serialNumber") == target:
+        print("yes")
+        break
+' <"$response_file")"
+  rm -f "$response_file"
+  [ "$found" = "yes" ]
+}
+
 fetch_reg_code() {
   log_section "Telemetry REG Code (org $MANAGE_ORG_ID)"
   local token response_file status code
@@ -1051,7 +1098,7 @@ redeem_reg_code() {
   local reg_code="$1"
   local serial_number="$2"
   local machine_type_id="$3"
-  local model_name payload response_file status secret_key message telemetry_machine_id
+  local model_name payload response_file status secret_key message telemetry_machine_id reg_type
 
   model_name="$(telemetry_model_name_for_type "$machine_type_id")"
   log "Resolved telemetry model name: $model_name"
@@ -1093,22 +1140,24 @@ else:
     print(nested.get("id") or "")
 ' <"$response_file")"
     message="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("message") or "")' <"$response_file")"
+    reg_type="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("type") or "")' <"$response_file")"
     rm -f "$response_file"
     if [ -n "$secret_key" ]; then
-      log "Telemetry MachineKey obtained automatically (no on-device REG entry needed)"
+      log "Telemetry MachineKey obtained automatically (no on-device REG entry needed), type=${reg_type:-unknown}"
       if [ -n "$telemetry_machine_id" ]; then
         log "Telemetry MachineId: $telemetry_machine_id"
       else
         log "Registration response had no recognizable machineId field — MachineId will be left null in telemetry.json"
       fi
-      # Two lines on stdout (secret_key, telemetry_machine_id) — this function's return value is
-      # captured via $(...) by the caller, so nothing else may write to stdout from in here.
-      # apply_telemetry_credentials() is deliberately NOT called from this function: it's a plain
-      # function (not a subshell) that logs via log()/prints via python, and calling it inside a
-      # command-substitution context would leak that output into the captured return value (this
-      # bit us once already — see [[bug-bootstrap-telemetry-machinekey-not-written-to-device-plus-wrong-default-org]]
-      # follow-up). The caller (main()) applies the credentials after capturing both values.
-      printf '%s\n%s\n' "$secret_key" "$telemetry_machine_id"
+      # Three lines on stdout (secret_key, telemetry_machine_id, reg_type) — this function's return
+      # value is captured via $(...) by the caller, so nothing else may write to stdout from in
+      # here. apply_telemetry_credentials() is deliberately NOT called from this function: it's a
+      # plain function (not a subshell) that logs via log()/prints via python, and calling it
+      # inside a command-substitution context would leak that output into the captured return
+      # value (this bit us once already — see
+      # [[bug-bootstrap-telemetry-machinekey-not-written-to-device-plus-wrong-default-org]]
+      # follow-up). The caller applies the credentials after capturing all three values.
+      printf '%s\n%s\n%s\n' "$secret_key" "$telemetry_machine_id" "$reg_type"
       return 0
     fi
     log "Telemetry registration response had no secretKey (message: ${message:-none})"
@@ -1120,6 +1169,67 @@ else:
   sed -n '1,200p' "$response_file" >&2 || true
   rm -f "$response_file"
   record_warning "Could not redeem telemetry REG code via API — on-device REG entry still needed"
+  return 1
+}
+
+# Wraps redeem_reg_code() with the verify-or-burn-and-retry loop: a secretKey coming back is not
+# proof manage.ishakerusa.com actually created the machine (see
+# [[manage-registration-mints-keycloak-not-machine-record]]), and retrying the SAME serial only
+# ever gets a "REFRESH" of the already-orphaned client, never a fresh registration attempt. So each
+# failed-to-verify attempt burns that serial for good and moves to a new one (base serial suffixed
+# with a random tag) until manage's own machine list actually shows it, or attempts run out.
+#
+# On success prints THREE lines: the serial_number that actually worked (may differ from
+# $base_serial — callers must use this one for everything downstream: Strapi record,
+# hard_settings.MachineSerial, credentials file), machine_key, telemetry_machine_id.
+register_telemetry_with_retry() {
+  local base_serial="$1"
+  local machine_type_id="$2"
+  local org_id="$MANAGE_ORG_ID"
+  local reg_code attempt candidate_serial redeem_output machine_key telemetry_machine_id reg_type
+  local poll verified
+
+  log_section "Telemetry registration (verify-or-retry, up to $TELEMETRY_REGISTER_MAX_ATTEMPTS attempts)"
+
+  reg_code="$(fetch_reg_code)" || return 1
+
+  for attempt in $(seq 1 "$TELEMETRY_REGISTER_MAX_ATTEMPTS"); do
+    if [ "$attempt" -eq 1 ]; then
+      candidate_serial="$base_serial"
+    else
+      candidate_serial="${base_serial}-r$(python3 -c 'import secrets; print(secrets.token_hex(2))')"
+    fi
+    log "Attempt $attempt/$TELEMETRY_REGISTER_MAX_ATTEMPTS: redeeming reg code $reg_code for serial $candidate_serial"
+
+    redeem_output="$(redeem_reg_code "$reg_code" "$candidate_serial" "$machine_type_id" || true)"
+    machine_key="$(printf '%s\n' "$redeem_output" | sed -n '1p')"
+    telemetry_machine_id="$(printf '%s\n' "$redeem_output" | sed -n '2p')"
+    reg_type="$(printf '%s\n' "$redeem_output" | sed -n '3p')"
+
+    if [ -z "$machine_key" ]; then
+      log "Attempt $attempt: no MachineKey returned for $candidate_serial — trying a fresh serial"
+      continue
+    fi
+
+    verified=0
+    for poll in $(seq 1 "$TELEMETRY_VERIFY_POLL_ATTEMPTS"); do
+      if manage_machine_registered "$org_id" "$candidate_serial"; then
+        verified=1
+        break
+      fi
+      sleep "$TELEMETRY_VERIFY_POLL_DELAY"
+    done
+
+    if [ "$verified" = "1" ]; then
+      log "CONFIRMED: $candidate_serial (type=${reg_type:-unknown}) is visible in manage org $org_id machine list"
+      printf '%s\n%s\n%s\n' "$candidate_serial" "$machine_key" "$telemetry_machine_id"
+      return 0
+    fi
+
+    log "Attempt $attempt: $candidate_serial got a Keycloak client (type=${reg_type:-unknown}) but never showed up in manage org $org_id's machine list after ${TELEMETRY_VERIFY_POLL_ATTEMPTS}x${TELEMETRY_VERIFY_POLL_DELAY}s — burning this serial, trying a new one"
+  done
+
+  record_warning "Exhausted $TELEMETRY_REGISTER_MAX_ATTEMPTS telemetry registration attempts — none produced a manage machine record (known manage.ishakerusa.com-side gap). Falling back to on-device manual REG entry with base serial $base_serial."
   return 1
 }
 
@@ -1516,17 +1626,21 @@ main() {
   reg_code="$(fetch_reg_code || true)"
   machine_key=""
   telemetry_machine_id=""
-  if [ -n "$reg_code" ]; then
-    redeem_output="$(redeem_reg_code "$reg_code" "$serial_number" "$machine_type_id" || true)"
-    machine_key="$(printf '%s\n' "$redeem_output" | sed -n '1p')"
-    telemetry_machine_id="$(printf '%s\n' "$redeem_output" | sed -n '2p')"
-    if [ -n "$machine_key" ]; then
-      apply_telemetry_credentials "$machine_key" "$telemetry_machine_id" "$MANAGE_ORG_ID"
-      # Registration mints a Keycloak client id == serial_number; point ShakerView's client_id
-      # (hard_settings.MachineSerial) at it, then prove the pair actually authenticates.
-      apply_hard_settings_serial "$serial_number"
-      verify_telemetry_auth "$serial_number" "$machine_key" || true
-    fi
+  redeem_output="$(register_telemetry_with_retry "$serial_number" "$machine_type_id" || true)"
+  if [ -n "$redeem_output" ]; then
+    # register_telemetry_with_retry() may have burned the originally-entered serial and settled on
+    # a suffixed one instead — everything from here on (Strapi record, on-device MachineSerial,
+    # credentials file) MUST use the serial that's actually confirmed registered, not the one the
+    # operator typed in.
+    serial_number="$(printf '%s\n' "$redeem_output" | sed -n '1p')"
+    machine_key="$(printf '%s\n' "$redeem_output" | sed -n '2p')"
+    telemetry_machine_id="$(printf '%s\n' "$redeem_output" | sed -n '3p')"
+    log "Telemetry-confirmed serial_number: $serial_number"
+    apply_telemetry_credentials "$machine_key" "$telemetry_machine_id" "$MANAGE_ORG_ID"
+    # Registration mints a Keycloak client id == serial_number; point ShakerView's client_id
+    # (hard_settings.MachineSerial) at it, then prove the pair actually authenticates.
+    apply_hard_settings_serial "$serial_number"
+    verify_telemetry_auth "$serial_number" "$machine_key" || true
   fi
   machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret")"
 
