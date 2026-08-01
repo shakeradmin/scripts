@@ -53,7 +53,7 @@ USAGE
   python3 fleetpatch.py --patch 12 --max 1
   python3 fleetpatch.py --patch 12 --machine 61
 """
-import argparse, hashlib, importlib.util, json, os, re, subprocess, sys, time
+import argparse, fcntl, hashlib, importlib.util, json, os, re, subprocess, sys, time
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -62,7 +62,10 @@ ARTIFACT_ROOT = os.path.join(HOME, "fleetpatch", "artifacts")
 LOG_ROOT = os.path.join(HOME, "fleetpatch")
 STRAPI = os.environ.get("STRAPI_BASE_URL", "http://localhost:1338")
 SSH_TIMEOUT = 20
-RESTART_WAIT = 45          # AppManager relaunch + Unity boot
+RESTART_WAIT = 45          # first look after the kill; verify() then waits properly
+PROCESS_WAIT = 120         # how long verify() waits for the app to come back at all.
+                           # Must exceed AppManager's RESTART_DELAY (40s grace) + Unity boot.
+HEARTBEAT_WAIT = 150       # how long to wait for PatchDiag's next heartbeat (interval is 60s)
 UA = "fleetpatch/1.0"
 
 SV_DIR = "~/ShakerView2.0Linux/ShakerView2.0_Data"
@@ -253,18 +256,39 @@ def verify(target, want_md5):
     rc, live = ssh(target, f"md5sum {SV_DIR}/Managed/CommonCode.dll | cut -d' ' -f1")
     if rc != 0 or live.strip() != want_md5:
         return False, f"md5 mismatch after copy: {live.strip()[:12]}"
-    rc, pid = ssh(target, f"pgrep -f '^{SV_BIN}$' | head -1")
-    if rc != 0 or not pid.strip():
-        return False, "process not running"
+
+    # Wait for the app rather than demanding it be up already. AppManager gained a
+    # RESTART_DELAY grace (40s) in 2026-07-29, deliberately, so a technician who closes the
+    # kiosk by hand is not fought by the watchdog -- but that grace lands squarely inside this
+    # check. On machine 94 the app came back 53s after the kill, RESTART_WAIT was 45s, and the
+    # first heartbeat of the new process arrived 3 SECONDS after the 65s comparison window
+    # closed. A healthy patch was rolled back over three seconds.
+    deadline = time.time() + PROCESS_WAIT
+    pid = ""
+    while time.time() < deadline:
+        rc, pid = ssh(target, f"pgrep -f '^{SV_BIN}$' | head -1")
+        if rc == 0 and pid.strip():
+            break
+        time.sleep(5)
+    if not pid.strip():
+        return False, f"process not running {PROCESS_WAIT}s after restart"
+
     # First-time patch: the diag file does not exist until the new build writes it, and a
     # bare `grep -c` on a missing file yields an empty string that reads as "not advancing"
     # and triggers a needless rollback. Normalise every failure mode to 0.
     hb = f"( [ -f {DIAG} ] && grep -ac heartbeat {DIAG} || echo 0 ) | head -1"
     rc, hb1 = ssh(target, hb)
-    time.sleep(65)
-    rc, hb2 = ssh(target, hb)
-    if not (hb1.strip().isdigit() and hb2.strip().isdigit() and int(hb2) > int(hb1)):
-        return False, "PatchDiag heartbeat not advancing"
+    # Poll for the next heartbeat instead of sampling twice around a fixed sleep. PatchDiag's
+    # interval is 60s, so a fixed window barely longer than that fails whenever the app happens
+    # to start late in it -- which is exactly what the AppManager grace guarantees.
+    deadline = time.time() + HEARTBEAT_WAIT
+    while time.time() < deadline:
+        time.sleep(10)
+        rc, hb2 = ssh(target, hb)
+        if hb1.strip().isdigit() and hb2.strip().isdigit() and int(hb2) > int(hb1):
+            break
+    else:
+        return False, f"PatchDiag heartbeat not advancing within {HEARTBEAT_WAIT}s"
     rc, exc = ssh(target, f"grep -ac 'MissingMethodException\\|TypeLoadException' {PLAYER_LOG}")
     if exc.strip().isdigit() and int(exc) > 0:
         return False, f"{exc.strip()} MissingMethod/TypeLoad exceptions"
@@ -350,6 +374,21 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true", help="patch even if the kiosk looks in use")
     args = ap.parse_args()
+
+    # The SAME lock the cron wrapper takes, held here so a hand-run cannot race the sweep.
+    #
+    # It could, and did (2026-08-01, machine 94): a manual --machine 94 started 18s before the
+    # */15 tick, both reached the same machine, and the two runs interleaved a backup, an
+    # install, a rollback and a second install on one kiosk. Only the wrapper held the lock, so
+    # nothing stopped the hand-run from walking into the sweep. An install restarts a kiosk and
+    # spends two minutes verifying it; two of those on one machine cannot be made safe by
+    # care alone.
+    lock = open("/tmp/fleetpatch.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another fleetpatch run holds the lock — exiting rather than racing it")
+        return
 
     env = lpm.load_env()
     ident = env.get("STRAPI_MACHINE_USER_USERNAME") or env.get("STRAPI_MACHINE_USER_LOGIN")

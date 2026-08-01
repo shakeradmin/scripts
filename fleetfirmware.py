@@ -34,10 +34,16 @@ WHAT THIS DOES, AND THE ONE THING IT DELIBERATELY DOES NOT
          was meant to rescue that and could not, because it watched from a main-thread
          coroutine — the one thread that had stopped running.
 
-         The rescue now lives on a background timer (FirmwareFlashWatchdog v2) and kills the
+         The rescue now lives on a background timer (FirmwareFlashWatchdog) and kills the
          process outright, so AppManager relaunches a working kiosk. This sweeper therefore
          refuses to arm unless `FirmwareFlashWatchdog` is present in the machine's own
          CommonCode.dll — the binary's answer, not Strapi's patch relation, which drifts.
+
+         The first real unattended flash (machine 94, 2026-08-01) taught two more things. The
+         write took 505s of a 600s absolute deadline, so v3 judges PROGRESS — the flasher's own
+         per-line log counter — instead of elapsed time, and holds off as long as it climbs.
+         And the SUCCESS path wedges too: the app deletes the hex, then queues its restart onto
+         the stalled main thread and never runs it, so the watchdog has to finish the job.
 
          Second reason, which stands regardless: flashing invalidates the water calibration
          for anything older than 260211-01 (see Strapi knowledge 26 sec.7). That is why
@@ -300,10 +306,18 @@ def stage(machine, src, want_md5, filename):
 
 # ---------------------------------------------------------------- unattended flash
 
-# How long the on-machine watchdog waits before deciding the flash is not going to finish and
-# putting the kiosk back in service. A full 45 KB image over the serial bootloader takes minutes;
-# this is a floor on "no longer plausibly working", not a target.
-FLASH_WATCHDOG_SECONDS = 600
+# On-machine watchdog budget, handed over in the marker file.
+#
+# These replace a single absolute deadline (600s), which the first real flash showed to be
+# dangerous: writing 2838 lines to machine 94 took 505s of that 600s budget, so a slower machine
+# or a bigger image would have had a HEALTHY write killed partway through programming the MCU.
+#
+# The watchdog now judges progress instead: ControllerFirmwareTestLoader logs one line per line
+# written, so while that counter climbs it holds off however long it takes. NO_PROGRESS_SECONDS
+# is total silence, matching FW_HOLD_GRACE in shakerview-watchdog.sh; MAX_TOTAL_SECONDS is only a
+# backstop for a fault that somehow keeps the counter crawling forever.
+FLASH_NO_PROGRESS_SECONDS = 300
+FLASH_MAX_TOTAL_SECONDS = 3600
 
 # Two attempts, then it needs a human. A flash that fails twice is not going to start working on
 # the third unattended try, and each attempt costs the kiosk a restart.
@@ -327,7 +341,8 @@ d = json.loads(raw.decode("utf-8-sig"))
 d["NeedToUpdateFirmware"] = True
 open(p + ".pre-autoflash", "wb").write(raw)
 open(p, "wb").write((b"\xef\xbb\xbf" if bom else b"") + json.dumps(d, indent=2, ensure_ascii=False).encode())
-m = {"armed_at": int(time.time()), "timeout_seconds": %(timeout)d,
+m = {"armed_at": int(time.time()),
+     "no_progress_seconds": %(no_progress)d, "max_total_seconds": %(max_total)d,
      "hex": "%(hexname)s", "target_version": "%(version)s", "armed_by": "fleetfirmware"}
 open("%(d)s/Config/fleet_flash_armed.json", "w").write(json.dumps(m, indent=2))
 PY
@@ -357,7 +372,9 @@ def arm_flash(machine, fw, filename, dry_run):
     target = f"{machine.get('ssh_user') or 'shaker'}@{machine['tailscale_ip']}"
     if dry_run:
         return True, "would arm"
-    cmd = ARM_SCRIPT % {"d": SV_DATA, "timeout": FLASH_WATCHDOG_SECONDS,
+    cmd = ARM_SCRIPT % {"d": SV_DATA,
+                        "no_progress": FLASH_NO_PROGRESS_SECONDS,
+                        "max_total": FLASH_MAX_TOTAL_SECONDS,
                         "hexname": filename, "version": fw["version"]}
     rc, out = ssh(target, cmd, timeout=60)
     if rc != 0:
@@ -458,11 +475,12 @@ def try_arm(m, p, fw, filename, status, dry_run, now, budget):
         return "would ARM unattended flash"
     status.update(action="armed", armed_at=now, needs_onsite=False,
                   flash_attempts=int(status.get("flash_attempts") or 0),
-                  flash_watchdog_seconds=FLASH_WATCHDOG_SECONDS)
+                  flash_no_progress_seconds=FLASH_NO_PROGRESS_SECONDS,
+                  flash_max_total_seconds=FLASH_MAX_TOTAL_SECONDS)
     status.pop("flash_blocked_by", None)
     budget["left"] -= 1
     return (f"ARMED unattended flash and restarted the app — the watchdog puts the kiosk back "
-            f"in service within {FLASH_WATCHDOG_SECONDS}s if it does not take")
+            f"in service if the write goes silent for {FLASH_NO_PROGRESS_SECONDS}s")
 
 
 # ---------------------------------------------------------------- main
