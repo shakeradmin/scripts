@@ -211,6 +211,37 @@ def check_media_keys(target, serial, ctoken):
     return st, notes
 
 
+def firmware_write_active(target):
+    """Is the machine mid-way through writing its controller firmware? (reason, or (False, ''))
+
+    Mirrors shakerview-watchdog.sh's firmware_write_active(). Two independent signals, because
+    they cover different halves of the window:
+
+      * fleet_flash_armed.json — fleetfirmware has armed a flash but the app has not restarted
+        into it yet. The marker is renamed to .consumed.json the moment the app reads it, so its
+        presence means "about to flash", not "flashed once, long ago".
+      * a staged .hex plus ControllerUpdatePage in the Player log — the write itself is running.
+
+    Deliberately fails SAFE: if the probe cannot answer, say busy. A missed media restart costs
+    one sweep; a kill -9 through a half-written MCU costs the board.
+    """
+    probe = (
+        "D=~/ShakerView2.0Linux/ShakerView2.0_Data; "
+        "test -f $D/Config/fleet_flash_armed.json && { echo ARMED; exit 0; }; "
+        "if compgen -G \"$D\"/*.hex >/dev/null 2>&1 && "
+        "tail -c 200000 ~/.config/unity3d/*/*/Player.log 2>/dev/null | grep -qa ControllerUpdatePage; "
+        "then echo WRITING; else echo IDLE; fi")
+    rc, out = ssh_run(target, probe)
+    out = (out or "").strip()
+    if rc != 0:
+        return True, "could not check whether a firmware write is in progress"
+    if "ARMED" in out:
+        return True, "a controller-firmware flash is armed and about to run"
+    if "WRITING" in out:
+        return True, "a controller-firmware write is in progress"
+    return False, ""
+
+
 def sweep_machine(m, token, dry_run=False, verbose=False):
     mdir = os.path.join(STATE_ROOT, str(m["id"]))
     os.makedirs(mdir, exist_ok=True)
@@ -279,10 +310,23 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
 
     # 4) restart for media-only changes
     if restart_needed and not cells_restarted and not dry_run:
-        rcmd = ("PID=$(ps -eo pid,comm | awk '$2 ~ /^ShakerView2.0/ {print $1}'); "
-                "[ -n \"$PID\" ] && kill -9 $PID && echo restarted")
-        rc, out = ssh_run(target, rcmd)
-        notes.append("app restarted (media)" if "restarted" in out else "WARN: restart kill failed")
+        # Never interrupt a controller-firmware write. Since fleetfirmware can arm one
+        # unattended (2026-08-01), a media change landing mid-write would kill -9 the app
+        # partway through programming the MCU — the one restart on this machine that can leave
+        # hardware in a state no software fix reaches. shakerview-watchdog.sh already holds off
+        # for this; the sweeper had no such check.
+        #
+        # Skipping only defers the restart: the manifest was already written, so the media is on
+        # disk and the app picks it up on the restart the flash itself performs, or on the next
+        # change. Losing a restart is cheap; losing a controller is not.
+        busy, why = firmware_write_active(target)
+        if busy:
+            notes.append(f"restart HELD OFF — {why}")
+        else:
+            rcmd = ("PID=$(ps -eo pid,comm | awk '$2 ~ /^ShakerView2.0/ {print $1}'); "
+                    "[ -n \"$PID\" ] && kill -9 $PID && echo restarted")
+            rc, out = ssh_run(target, rcmd)
+            notes.append("app restarted (media)" if "restarted" in out else "WARN: restart kill failed")
 
     if verbose:
         print(json.dumps(status, indent=1))
