@@ -1,0 +1,42 @@
+#!/bin/bash
+# AppManager — single-instance watchdog + memory guard for ShakerView. Tuned 2026-07-10.
+# Single instance is NEVER killed by dedupe (only acts when count>1). Recycles ShakerView if its
+# RSS exceeds the cap (leak backstop) so a leak drops one process for ~15s instead of OOM-freezing.
+# 2026-07-29: added RESTART_DELAY — a technician who closes ShakerView by hand now gets a grace
+# period before the watchdog brings it back. Boot (first launch) and RSS recycles skip the grace.
+export DISPLAY=:0
+export XAUTHORITY=/run/user/1000/gdm/Xauthority
+BIN="/home/shaker/ShakerView2.0Linux/ShakerView2.0.x86_64"
+RSS_CAP_MB=2000
+RELAUNCH_GAP=30    # seconds to wait after (re)launching ShakerView before the next check — spaces out restarts
+RESTART_DELAY=40   # grace period after ShakerView disappears before the watchdog relaunches it
+first=1            # very first launch after boot must not wait out the grace period
+recycled=0         # set when WE killed it (RSS cap) — leak backstop must recover fast
+while true; do
+  pids=$(pgrep -f "ShakerView2.0.x86_64$")
+  count=$(printf '%s\n' "$pids" | grep -c .)
+  if [ "$count" -eq 0 ]; then
+    if [ "$first" -eq 0 ] && [ "$recycled" -eq 0 ]; then
+      sleep "$RESTART_DELAY"
+      pids=$(pgrep -f "ShakerView2.0.x86_64$")
+      if [ -n "$pids" ]; then continue; fi   # came back on its own during the grace period
+    fi
+    first=0; recycled=0
+    setsid "$BIN" >/dev/null 2>&1 &
+    sleep "$RELAUNCH_GAP"; continue
+  fi
+  first=0
+  if [ "$count" -gt 1 ]; then
+    keep=$(ps -o pid=,etimes= -p $pids 2>/dev/null | sort -k2 -n | tail -1 | awk '{print $1}')
+    for p in $pids; do [ -n "$keep" ] && [ "$p" != "$keep" ] && kill -9 "$p" 2>/dev/null; done
+  else
+    keep=$pids
+  fi
+  rss=$(ps -o rss= -p "$keep" 2>/dev/null | tr -d ' ')
+  if [ -n "$rss" ] && [ "$rss" -gt $((RSS_CAP_MB*1024)) ]; then
+    echo "$(date '+%F %T') AppManager: RSS ${rss}KB > cap, recycling ShakerView" >> /home/shaker/appmanager.log
+    kill -9 "$keep" 2>/dev/null
+    recycled=1
+  fi
+  sleep 15
+done
