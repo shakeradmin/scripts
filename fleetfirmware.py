@@ -50,12 +50,16 @@ GATE — a machine is staged only when all hold (mirrors fleetpatch):
   3. the machine is reachable and has ShakerView
   4. target version > version read off the controller      never downgrades, never re-stages equal
 
+  5. the image fits the machine's own IsTouch2   machine_types is a hand-maintained tag; this
+                                                 checks what the app would actually open
+
 FLASH GATE — staging only stages. Arming the write additionally needs ALL of:
-  5. machine.isFirmwareAutoflash == true       separate opt-in; default false
-  6. FirmwareFlashWatchdog in its CommonCode.dll   it must be able to recover from a failed write
-  7. no flash already pending or unconsumed     never arm twice over the same attempt
-  8. kiosk idle (CurrentScreen = StartScreen)   never restart a machine somebody is standing at
-  9. fewer than MAX_FLASH_ATTEMPTS failures     two failures mean it needs a human, not a third try
+  6. machine.isFirmwareAutoflash == true       separate opt-in; default false
+  7. FirmwareFlashWatchdog in its CommonCode.dll   it must be able to recover from a failed write
+  8. no flash already pending or unconsumed     never arm twice over the same attempt
+  9. kiosk idle (CurrentScreen = StartScreen)   never restart a machine somebody is standing at
+ 10. fewer than MAX_FLASH_ATTEMPTS failures     two failures mean it needs a human, not a third try
+ 11. MAX_ARMS_PER_SWEEP not yet spent          arm one machine per run, never the whole fleet
 
 Resting state is "no stable firmware — nothing to do": with every record at isStable=false this
 prints nothing and touches nothing. Flipping one to isStable=true is the release action.
@@ -305,6 +309,11 @@ FLASH_WATCHDOG_SECONDS = 600
 # the third unattended try, and each attempt costs the kiosk a restart.
 MAX_FLASH_ATTEMPTS = 2
 
+# Canary rule, borrowed from fleetpatch's --max: however many machines qualify, arm ONE per
+# sweep. Staging is inert and can safely fan out; arming writes an MCU and restarts a kiosk, and
+# the hourly cron runs unattended with no human watching the first one land.
+MAX_ARMS_PER_SWEEP = 1
+
 ARM_SCRIPT = r"""
 set -e
 D=%(d)s
@@ -424,12 +433,18 @@ def clear_consumed_marker(machine):
     ssh(target, f"rm -f {SV_DATA}/Config/fleet_flash_armed.consumed.json")
 
 
-def try_arm(m, p, fw, filename, status, dry_run, now):
+def try_arm(m, p, fw, filename, status, dry_run, now, budget):
     """Arm an unattended flash if every gate allows it. Returns a log line, or None.
 
     Records the blocking reason on `status` either way, so the fleet report says why a machine is
     still waiting on a human rather than silently looking identical to one that is not opted in.
+
+    `budget` is the per-sweep arming allowance, mutated in place so the caller keeps count.
     """
+    if budget["left"] <= 0:
+        status["flash_blocked_by"] = (f"already armed {MAX_ARMS_PER_SWEEP} machine(s) this sweep "
+                                      f"— next one waits for the following run")
+        return None
     why = flash_blockers(m, p)
     if why:
         status["flash_blocked_by"] = why
@@ -445,13 +460,14 @@ def try_arm(m, p, fw, filename, status, dry_run, now):
                   flash_attempts=int(status.get("flash_attempts") or 0),
                   flash_watchdog_seconds=FLASH_WATCHDOG_SECONDS)
     status.pop("flash_blocked_by", None)
+    budget["left"] -= 1
     return (f"ARMED unattended flash and restarted the app — the watchdog puts the kiosk back "
             f"in service within {FLASH_WATCHDOG_SECONDS}s if it does not take")
 
 
 # ---------------------------------------------------------------- main
 
-def sweep_one(m, firmwares, token, dry_run, report_only):
+def sweep_one(m, firmwares, token, dry_run, report_only, budget):
     name = f"{m['id']} {m.get('serial_number') or m.get('title') or ''}".strip()
     p = probe(m)
     now = time.strftime("%FT%TZ", time.gmtime())
@@ -528,7 +544,7 @@ def sweep_one(m, firmwares, token, dry_run, report_only):
         waited = int((time.time() - time.mktime(time.strptime(since, "%Y-%m-%dT%H:%M:%SZ"))) / 86400)
         status.update(action="staged", staged_at=since, staged_md5=want_md5,
                       needs_onsite=True, waiting_days=waited)
-        armed_line = try_arm(m, p, fw, filename, status, dry_run, now)
+        armed_line = try_arm(m, p, fw, filename, status, dry_run, now, budget)
         if armed_line:
             return name, f"{cur} -> {tgt} {armed_line}", status
         return name, (f"{cur} -> {tgt} STAGED {waited}d ago, still needs: Service Mode -> "
@@ -552,7 +568,7 @@ def sweep_one(m, firmwares, token, dry_run, report_only):
                   needs_onsite=True, waiting_days=0)
     # The hex only just landed, so re-probe rather than trusting the pre-stage snapshot.
     p = probe(m) or p
-    armed_line = try_arm(m, p, fw, filename, status, dry_run, now)
+    armed_line = try_arm(m, p, fw, filename, status, dry_run, now, budget)
     if armed_line:
         return name, f"{cur} -> {tgt} STAGED {filename} + {armed_line}", status
     return name, (f"{cur} -> {tgt} STAGED {filename} — now needs on site: Service Mode -> "
@@ -586,8 +602,9 @@ def main():
             for f in fws))
 
     staged = 0
+    budget = {"left": MAX_ARMS_PER_SWEEP}
     for m in machines(token, a.machine):
-        name, line, status = sweep_one(m, fws, token, a.dry_run, a.report)
+        name, line, status = sweep_one(m, fws, token, a.dry_run, a.report, budget)
         if status and STRAPI_HAS_SCHEMA:
             try:
                 api_put(f"/api/machines/{m['id']}", token,
