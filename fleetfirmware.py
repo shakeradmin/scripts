@@ -356,6 +356,35 @@ def arm_flash(machine, fw, filename, dry_run):
     return True, out.strip()
 
 
+# What ControllerFirmwareTestLoader.Start() will actually open, per IsTouch2. Names come from
+# Settings.ControllerHexFilePath / ControllerHexFileTouch2 / ControllerHexFileTouch2FWP.
+S_IMAGE = "shkr_m_con"
+TOUCH2_IMAGES = ("mdrv_touch",)
+
+
+def image_mismatch(filename, p):
+    """Refuse an image the machine would never load. Returns a reason, or None if it fits.
+
+    machine_types is an operator-maintained tag and it is the only thing that currently decides
+    which image reaches which machine. That is one human mistake away from staging an S image at
+    a Touch 2 board, so this cross-checks against the machine's OWN IsTouch2 flag, which is what
+    the app actually branches on when it picks the file to open.
+
+    It matters here specifically: machine 94 is a Touch-typed machine whose IsTouch2 is false, so
+    it correctly wants the S image, and the shaker-touch tag on the firmware record exists for it.
+    Nothing but this check then stops that same record reaching a real Touch 2.
+    """
+    name = (filename or "").lower()
+    is_touch2 = bool(p.get("is_touch2"))
+    if is_touch2 and not any(t in name for t in TOUCH2_IMAGES):
+        return (f"machine has IsTouch2=true and loads MDRV_TOUCH.hex, but this record ships "
+                f"{filename} — refusing, it would never be flashed and only litters _Data/")
+    if not is_touch2 and any(t in name for t in TOUCH2_IMAGES):
+        return (f"machine has IsTouch2=false and loads {S_IMAGE.upper()}*.hex, but this record "
+                f"ships {filename} — refusing")
+    return None
+
+
 def flash_blockers(m, p):
     """Everything that must hold before a flash is armed. Returns a reason, or None to proceed.
 
@@ -486,6 +515,13 @@ def sweep_one(m, firmwares, token, dry_run, report_only):
         return name, f"{cur} -> {tgt} but {md5_or_err}", status
     want_md5 = md5_or_err
     filename = fw.get("hex_filename") or os.path.basename(src)
+
+    # Checked before staging, not just before arming: an image the machine cannot load is dead
+    # weight in _Data/ and shows up later as somebody else's "foreign image already staged".
+    wrong = image_mismatch(filename, p)
+    if wrong:
+        status["action"] = f"image does not match the machine: {wrong}"
+        return name, f"{cur} -> {tgt} BLOCKED: {wrong}", status
 
     if p["staged_md5"] == want_md5:
         since = prev.get("staged_at") or now
