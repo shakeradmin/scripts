@@ -383,7 +383,18 @@ def main():
     # nothing stopped the hand-run from walking into the sweep. An install restarts a kiosk and
     # spends two minutes verifying it; two of those on one machine cannot be made safe by
     # care alone.
-    lock = open("/tmp/fleetpatch.lock", "w")
+    # fd 9 is the wrapper's own lock (exec 9>/tmp/fleetpatch.lock; flock -n 9), inherited
+    # into this process across exec(). flock(2) locks are per open-file-description, not
+    # per inode or per process -- so opening the same path fresh here and flocking THAT
+    # would always collide with our own inherited fd 9, failing every single cron-launched
+    # run unconditionally (bug live 2026-08-01 17:20 -> 2026-08-02 ~16:30, blocked the
+    # entire fleet). Reuse fd 9 when it's already ours; only open+lock a fresh fd for a
+    # standalone hand-run where fd 9 was never opened.
+    try:
+        os.fstat(9)
+        lock = os.fdopen(9, "w")
+    except OSError:
+        lock = open("/tmp/fleetpatch.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
