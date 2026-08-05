@@ -445,7 +445,10 @@ if [ -n "$SERIAL_FJ" ] && [ -n "$SERIAL_HS" ] && [ "$SERIAL_FJ" != "$SERIAL_HS" 
 fi
 
 # 4.6 Controller firmware against the one fleet-wide target.
-FWRAW="$(grep -hoE 'ControllerVersionAnswer[[:space:]]+[0-9A-F]{12,}' "$DATA"/Logs/*.log 2>/dev/null | tail -1 | awk '{print $2}')"
+# -a: the logs carry NUL bytes after any unclean power cut, and grep without it reports
+# "binary file matches" and emits nothing -- reading as "controller never announced itself"
+# on a machine whose controller is perfectly fine.
+FWRAW="$(grep -ahoE 'ControllerVersionAnswer[[:space:]]+[0-9A-F]{12,}' "$DATA"/Logs/*.log 2>/dev/null | tail -1 | awk '{print $2}')"
 if [ -n "$FWRAW" ]; then
   FWVER="$(python3 -c "
 b=bytes.fromhex('$FWRAW'.strip())

@@ -252,7 +252,11 @@ C=$D/Config/hard_settings.json
 test -d "$D" || { echo "NO_SHAKERVIEW"; exit 0; }
 S=$(grep -o '"MachineSerial": *"[^"]*"' $C 2>/dev/null | head -1 | cut -d'"' -f4)
 M=$(grep -o '"IsSModel": *[a-z]*' $C 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
-V=$(grep -hoE 'ControllerVersionAnswer[[:space:]]+[0-9A-F]{12,}' $D/Logs/*.log 2>/dev/null | tail -1 | awk '{print $2}')
+# -a is load-bearing: ShakerView logs pick up NUL bytes from every unclean power cut, and
+# GNU grep then prints "binary file matches" to stderr and NOTHING to stdout. The version
+# read as empty and the machine was skipped forever as "no ControllerVersionAnswer" --
+# silently excluding exactly the machines that freeze and get power-cycled.
+V=$(grep -ahoE 'ControllerVersionAnswer[[:space:]]+[0-9A-F]{12,}' $D/Logs/*.log 2>/dev/null | tail -1 | awk '{print $2}')
 H=$(md5sum $D/*.hex 2>/dev/null | head -1 | awk '{print $1}')
 N=$(ls $D/*.hex 2>/dev/null | head -1 | xargs -r basename)
 T=$(grep -o '"IsTouch2": *[a-z]*' $C 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
