@@ -257,6 +257,15 @@ M=$(grep -o '"IsSModel": *[a-z]*' $C 2>/dev/null | head -1 | cut -d: -f2 | tr -d
 # read as empty and the machine was skipped forever as "no ControllerVersionAnswer" --
 # silently excluding exactly the machines that freeze and get power-cycled.
 V=$(grep -ahoE 'ControllerVersionAnswer[[:space:]]+[0-9A-F]{12,}' $D/Logs/*.log 2>/dev/null | tail -1 | awk '{print $2}')
+# Age of that answer, in seconds. The controller announces itself on every connect, so a
+# version older than the running app means it has NOT answered this run -- the board is
+# absent or dead, and the number in the log is a fossil. Bench 004 sat on a 6-day-old line
+# and burned three unattended flash attempts against a machine with no controller attached.
+VLINE=$(grep -ah 'ControllerVersionAnswer' $D/Logs/*.log 2>/dev/null | tail -1 | grep -oE '^\[[0-9-]+ [0-9:]+' | tr -d '[')
+VAGE=""
+[ -n "$VLINE" ] && VAGE=$(( $(date +%%s) - $(date -d "$VLINE" +%%s 2>/dev/null || echo 0) ))
+# Seconds the kiosk process has been up, to compare against.
+UPS=$(ps -o etimes= -p "$(pgrep -f '^/home/shaker/ShakerView2.0Linux/ShakerView2.0.x86_64$' | head -1)" 2>/dev/null | tr -d ' ')
 H=$(md5sum $D/*.hex 2>/dev/null | head -1 | awk '{print $1}')
 N=$(ls $D/*.hex 2>/dev/null | head -1 | xargs -r basename)
 T=$(grep -o '"IsTouch2": *[a-z]*' $C 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
@@ -265,7 +274,7 @@ A=$(test -f $D/Config/fleet_flash_armed.json && echo armed || (test -f $D/Config
 F=$(grep -o '"NeedToUpdateFirmware": *[a-z]*' $D/Config/updater_settings.json 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
 P=$(grep -ao 'CurrentScreen = [A-Za-z]*' $HOME/.config/unity3d/ShakerTechnology/ShakerView2.0/Player.log 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
 R=$(pgrep -f '^/home/shaker/ShakerView2.0Linux/ShakerView2.0.x86_64$' | head -1)
-echo "$S|$M|$V|$H|$N|$T|$W|$A|$F|$P|$R"
+echo "$S|$M|$V|$H|$N|$T|$W|$A|$F|$P|$R|${VAGE:-}|${UPS:-}"
 """ % {"d": SV_DATA}
 
 
@@ -276,8 +285,9 @@ def probe(machine):
         return None
     if out.strip() == "NO_SHAKERVIEW":
         return {"no_sv": True}
-    f = (out.split("|") + [""] * 11)[:11]
-    serial, is_s, raw, staged_md5, staged_name, is_touch2, watchdog, armed, need_flag, screen, pid = f
+    f = (out.split("|") + [""] * 13)[:13]
+    (serial, is_s, raw, staged_md5, staged_name, is_touch2, watchdog, armed, need_flag,
+     screen, pid, ver_age, app_uptime) = f
     return {"no_sv": False, "serial": serial, "is_s": is_s == "true",
             "raw": raw, "version": decode_version(raw),
             "staged_md5": staged_md5, "staged_name": staged_name,
@@ -288,7 +298,13 @@ def probe(machine):
             # build with no rescue.
             "has_watchdog": watchdog.strip().isdigit() and int(watchdog) > 0,
             "armed": armed, "need_flag": need_flag == "true",
-            "screen": screen, "pid": pid.strip()}
+            "screen": screen, "pid": pid.strip(),
+            # The controller announces its version on every connect. If the newest such line
+            # predates the running app, it has not answered THIS run: the board is absent or
+            # dead and `version` is a fossil, not the current state.
+            "ver_stale": (ver_age.strip().isdigit() and app_uptime.strip().isdigit()
+                          and int(ver_age) > int(app_uptime) > 60),
+            "ver_age": int(ver_age) if ver_age.strip().isdigit() else None}
 
 
 def stage(machine, src, want_md5, filename):
@@ -429,6 +445,14 @@ def flash_blockers(m, p):
     if not p.get("has_watchdog"):
         return ("no FirmwareFlashWatchdog in CommonCode.dll — a failed flash would wedge the "
                 "kiosk with no way back")
+    if p.get("ver_stale"):
+        # There is nothing to flash. The write needs a controller that answers; without one
+        # ControllerFirmwareTestLoader consumes the .hex, writes zero lines, and the rescue
+        # watchdog kills the app 300s later. Bench 004 did that three times against a version
+        # last heard six days earlier, exhausting MAX_FLASH_ATTEMPTS on absent hardware.
+        days = (p["ver_age"] // 86400) if p.get("ver_age") else "?"
+        return (f"controller has not answered in this app run (last ControllerVersionAnswer "
+                f"~{days}d old) — board absent or dead; the logged version is stale, not current")
     if p.get("need_flag"):
         return "NeedToUpdateFirmware is already set — a flash is pending, not re-arming"
     if p.get("armed") == "armed":
