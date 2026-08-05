@@ -117,6 +117,13 @@ echo "WS=$(tail -c 40000 ~/.config/unity3d/*/*/Player.log 2>/dev/null | grep -a 
 echo "DISK=$(df -h /home | awk 'NR==2{print $4}')"
 echo "APTTIMER=$(systemctl is-enabled apt-daily.timer 2>&1)"
 echo "SNAPHOLD=$(command -v snap >/dev/null 2>&1 && { snap refresh --time 2>/dev/null | awk '/^hold:/{print $2}' | grep . || echo none; } || echo nosnapd)"
+echo "CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+echo "CSTATE=$(grep -o 'intel_idle.max_cstate=[0-9]' /proc/cmdline || echo none)"
+echo "CSTATEGRUB=$(grep -c 'intel_idle.max_cstate=1' /etc/default/grub 2>/dev/null || echo 0)"
+# Function count, not mere presence: an incomplete 2026-07-29 edit shipped a copy with every
+# body stripped, and the unit stays "active" while each call inside it fails.
+echo "WDFN=$([ -f /usr/local/bin/shakerview-watchdog.sh ] && grep -c '^[a-z_]*() *{' /usr/local/bin/shakerview-watchdog.sh || echo 0)"
+echo "WDACT=$(systemctl is-active shakerview-watchdog 2>&1)"
 """
 
 # Closing Ubuntu's update channels. `snap get system refresh.hold` stays "none" after a
@@ -146,7 +153,13 @@ def heartbeat(target):
             "diag_last": kv.get("DIAG", "").strip() or None,
             "disk_free": kv.get("DISK", "").strip() or None,
             "auto_updates": {"apt_timer": kv.get("APTTIMER", "").strip() or None,
-                             "snap_hold": kv.get("SNAPHOLD", "").strip() or None}}
+                             "snap_hold": kv.get("SNAPHOLD", "").strip() or None},
+            "freeze_protection": {
+                "cpu": kv.get("CPU", "").strip() or None,
+                "cstate_active": kv.get("CSTATE", "").strip() not in ("", "none"),
+                "cstate_in_grub": kv.get("CSTATEGRUB", "").strip() == "1",
+                "watchdog_functions": int(kv.get("WDFN", "0").strip() or 0),
+                "watchdog_unit": kv.get("WDACT", "").strip() or None}}
 
 
 def auto_updates_open(status):
@@ -178,6 +191,110 @@ def enforce_auto_updates_off(target):
     rc, out = ssh_run(target, "systemctl is-enabled apt-daily.timer 2>&1; "
                               "snap refresh --time 2>/dev/null | awk '/^hold:/{print $2}'")
     return ("masked" in out and "forever" in out), out.replace("\n", "/").strip("/")
+
+
+# CPUs with the Bay Trail deep-C-state erratum that hard-freezes this fleet (machines 25, 64,
+# 260511731, 260511736, 260511737 all traced to it). Kept identical to bootstrap.sh's list.
+CSTATE_CPU_PATTERN = ("J1900", "J1800", "J1750", "N2807", "N2840", "N2930")
+WATCHDOG_FUNCTIONS = 10   # a complete shakerview-watchdog.sh defines exactly this many
+
+# Writing the c-state clamp. update-grub is only run after checking /boot for a vmlinuz with no
+# matching initrd: an interrupted apt leaves one behind, and update-grub would make that orphan
+# the default menu entry and panic the machine on its next boot.
+ENFORCE_CSTATE_CMD = r"""sudo -S -p '' bash -c '
+for k in /boot/vmlinuz-*; do
+  [ -e "$k" ] || continue
+  v="${k#/boot/vmlinuz-}"
+  [ -f "/boot/initrd.img-$v" ] || { echo "ORPHAN_KERNEL=$v"; exit 3; }
+done
+grep -q "intel_idle.max_cstate=1" /etc/default/grub && { echo "ALREADY_IN_GRUB"; exit 0; }
+cp -a /etc/default/grub /etc/default/grub.pre-cstate-$(date +%Y%m%d-%H%M%S)
+if grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub; then
+  sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 intel_idle.max_cstate=1\"/" /etc/default/grub
+else
+  printf "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash intel_idle.max_cstate=1\"\n" >> /etc/default/grub
+fi
+grep -q "intel_idle.max_cstate=1" /etc/default/grub || { echo "EDIT_FAILED"; exit 4; }
+update-grub >/dev/null 2>&1 || { echo "UPDATE_GRUB_FAILED"; exit 5; }
+grep -q "intel_idle.max_cstate=1" /boot/grub/grub.cfg && echo "WRITTEN_NEEDS_REBOOT" || echo "NOT_IN_GRUBCFG"
+exit 0'
+"""
+
+
+def freeze_protection_gaps(status):
+    """What this machine is missing. Empty list = nothing to do.
+
+    Neither defence can live in the app -- the freeze is a CPU erratum -- so no patch can
+    deliver them, and before bootstrap.sh learned to install them (2026-08-05) every machine
+    needed hand-treatment after provisioning. Machines imaged earlier still have neither, and
+    they are exactly the ones that keep freezing.
+    """
+    fp = status.get("freeze_protection") or {}
+    gaps = []
+    if fp.get("watchdog_functions", 0) < WATCHDOG_FUNCTIONS or fp.get("watchdog_unit") != "active":
+        gaps.append("watchdog")
+    cpu = fp.get("cpu") or ""
+    if any(c in cpu for c in CSTATE_CPU_PATTERN) and not fp.get("cstate_active"):
+        gaps.append("cstate")
+    return gaps
+
+
+def enforce_watchdog(target):
+    """Install/repair the freeze watchdog. Returns (ok, detail). Restarts nothing but its unit."""
+    if not SUDO_PASS:
+        return False, "no SUDO_PASS in env"
+    src = os.path.join(SCRIPTS, "watchdog")
+    for f in ("shakerview-watchdog.sh", "shakerview-watchdog.service"):
+        if not os.path.exists(os.path.join(src, f)):
+            return False, f"missing {f} in {src}"
+    r = subprocess.run(["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                        "-o", "ConnectTimeout=8",
+                        os.path.join(src, "shakerview-watchdog.sh"),
+                        os.path.join(src, "shakerview-watchdog.service"),
+                        f"{target}:/tmp/"], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return False, f"scp failed: {(r.stderr or '').strip()[:120]}"
+    # Verify the delivered copy before installing it: a truncated transfer must never replace a
+    # working watchdog with a no-op.
+    cmd = (r"""sudo -S -p '' bash -c '
+N=$(grep -c "^[a-z_]*() *{" /tmp/shakerview-watchdog.sh)
+[ "$N" -ge %d ] || { echo "INCOMPLETE=$N"; exit 3; }
+bash -n /tmp/shakerview-watchdog.sh || { echo "SYNTAX_ERROR"; exit 4; }
+[ -f /usr/local/bin/shakerview-watchdog.sh ] && cp -a /usr/local/bin/shakerview-watchdog.sh   /usr/local/bin/shakerview-watchdog.sh.bak-$(date +%%Y%%m%%d-%%H%%M%%S)
+install -m 755 -o root -g root /tmp/shakerview-watchdog.sh /usr/local/bin/shakerview-watchdog.sh
+install -m 644 -o root -g root /tmp/shakerview-watchdog.service   /etc/systemd/system/shakerview-watchdog.service
+systemctl daemon-reload
+systemctl enable shakerview-watchdog >/dev/null 2>&1
+systemctl restart shakerview-watchdog
+rm -f /tmp/shakerview-watchdog.sh /tmp/shakerview-watchdog.service
+sleep 3
+echo "STATE=$(systemctl is-active shakerview-watchdog)"
+exit 0'
+""" % WATCHDOG_FUNCTIONS)
+    rc, out = ssh_run(target, cmd, timeout=60, stdin=SUDO_PASS + "\n")
+    out = (out or "").strip()
+    if rc != 0 or "STATE=active" not in out:
+        return False, out.replace("\n", "/")[:150] or f"rc={rc}"
+    return True, "installed and active"
+
+
+def enforce_cstate(target):
+    """Write intel_idle.max_cstate=1 to GRUB. Returns (ok, detail).
+
+    Deliberately does NOT reboot: that is a decision for whoever owns the machine's uptime, and
+    the clamp is inert until then. The gap keeps being reported until a reboot picks it up.
+    """
+    if not SUDO_PASS:
+        return False, "no SUDO_PASS in env"
+    rc, out = ssh_run(target, ENFORCE_CSTATE_CMD, timeout=90, stdin=SUDO_PASS + "\n")
+    out = (out or "").strip()
+    if "ORPHAN_KERNEL" in out:
+        return False, f"{out} — refused to run update-grub, it would arm an unbootable default entry"
+    if "WRITTEN_NEEDS_REBOOT" in out:
+        return True, "written to GRUB — inert until the machine reboots"
+    if "ALREADY_IN_GRUB" in out:
+        return True, "already in GRUB — inert until the machine reboots"
+    return False, out.replace("\n", "/")[:150] or f"rc={rc}"
 
 
 def media_manifest(token, machine_id):
@@ -392,6 +509,22 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
                      + (f"closed: {detail}" if ok else f"FAILED to close: {detail}"))
     elif open_ch:
         notes.append(f"auto-updates OPEN ({', '.join(open_ch)}) — dry-run, not touched")
+
+    # 1c) Freeze protection. Same shape as the block above and for the same reason: a machine
+    # provisioned before bootstrap.sh started installing these (2026-08-05), or imaged from an
+    # older golden, arrives with no defence against the Bay Trail c-state erratum and freezes.
+    # Five machines needed hand-treatment for this before it was automated. Neither action
+    # touches the kiosk binary and neither reboots.
+    gaps = freeze_protection_gaps(status)
+    if gaps and not dry_run:
+        for gap in gaps:
+            ok, detail = (enforce_watchdog(target) if gap == "watchdog"
+                          else enforce_cstate(target))
+            status.setdefault("freeze_protection", {})[f"{gap}_enforced"] = ok
+            notes.append(f"freeze protection: {gap} was MISSING — "
+                         + (f"fixed ({detail})" if ok else f"FAILED to fix: {detail}"))
+    elif gaps:
+        notes.append(f"freeze protection MISSING ({', '.join(gaps)}) — dry-run, not touched")
 
     restart_needed = False
 
