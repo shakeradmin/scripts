@@ -51,6 +51,17 @@ DIAGNOSE_URL="${DIAGNOSE_URL:-https://raw.githubusercontent.com/shakeradmin/scri
 SKIP_READINESS_GATE="${SKIP_READINESS_GATE:-0}"
 READINESS_VERDICT="NOT_RUN"
 READINESS_REPORT=""
+# Freeze protection. Bay Trail Celerons on this fleet hard-freeze on deep C-states (machines 25,
+# 64, 260511731, 260511736 all traced to it). Neither defence lives in the app, so no patch can
+# deliver them and every machine used to need hand-treatment after bootstrap -- which is exactly
+# why machines kept shipping with none:
+#   prevention -> intel_idle.max_cstate=1 kernel parameter
+#   recovery   -> shakerview-watchdog.sh systemd service (graduated ladder, see the script)
+SCRIPTS_RAW_URL="${SCRIPTS_RAW_URL:-https://raw.githubusercontent.com/shakeradmin/scripts/main}"
+SKIP_FREEZE_PROTECTION="${SKIP_FREEZE_PROTECTION:-0}"
+# CPUs with the erratum. Matched against /proc/cpuinfo "model name".
+CSTATE_CPU_PATTERN="${CSTATE_CPU_PATTERN:-J1900|J1800|J1750|N2807|N2840|N2930}"
+CSTATE_REBOOT_REQUIRED=0
 MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
 # Realm the MACHINE authenticates against (client_credentials, client_id == its serial). Used to
 # VERIFY that telemetry registration produced credentials ShakerView can actually authenticate with.
@@ -463,6 +474,127 @@ EOF
     snap_hold="$(snap refresh --time 2>/dev/null | awk '/^hold:/ {print $2}')"
     log "snap hold: ${snap_hold:-not held}"
     [ "$snap_hold" = "forever" ] || record_warning "snap auto-refresh is not held indefinitely"
+  fi
+}
+
+# Fetch a file from the scripts repo, preferring a copy sitting next to this script (so a local
+# checkout can be tested without pushing first). Echoes the path to use; empty on failure.
+fetch_repo_file() {
+  local relpath="$1" dest="$2"
+  local sibling="$(dirname "${BASH_SOURCE[0]}")/$relpath"
+  if [ -f "$sibling" ]; then
+    cp -f "$sibling" "$dest" && { printf '%s' "$dest"; return 0; }
+  fi
+  if curl -fsSL --max-time 30 "$SCRIPTS_RAW_URL/$relpath" -o "$dest" && [ -s "$dest" ]; then
+    printf '%s' "$dest"; return 0
+  fi
+  return 1
+}
+
+install_freeze_protection() {
+  log_section "Freeze protection (c-state clamp + ShakerView watchdog)"
+  if [ "$SKIP_FREEZE_PROTECTION" = "1" ]; then
+    record_warning "freeze protection SKIPPED by SKIP_FREEZE_PROTECTION=1 — a wedged kiosk will stay wedged until someone drives to it"
+    return 0
+  fi
+
+  # ---- 1. Recovery: the watchdog service ---------------------------------------------------
+  # Installed unconditionally, on every CPU: the c-state clamp only addresses the Bay Trail
+  # erratum, while a Unity main-thread stall can happen for other reasons entirely.
+  local tmp_sh tmp_svc tmp_test
+  tmp_sh="$(mktemp)"; tmp_svc="$(mktemp)"; tmp_test="$(mktemp)"
+  if fetch_repo_file "watchdog/shakerview-watchdog.sh" "$tmp_sh" >/dev/null \
+     && fetch_repo_file "watchdog/shakerview-watchdog.service" "$tmp_svc" >/dev/null; then
+    # Never overwrite a good copy with a broken download: an incomplete 2026-07-29 edit once
+    # shipped a script with every function body stripped, and it ran for a week as a silent
+    # no-op because the unit stays "active" while each call inside it fails.
+    local missing=""
+    local fn
+    for fn in log xauth_file as_user_x sv_pid firmware_write_active health_check \
+              recover_dpms recover_restart_app recover_restart_gdm recover_reboot; do
+      grep -qE "^$fn\(\) *\{" "$tmp_sh" || missing="$missing $fn"
+    done
+    if [ -n "$missing" ] || ! bash -n "$tmp_sh" 2>/dev/null; then
+      record_warning "fetched watchdog script is unusable (missing:${missing:-none}, syntax $(bash -n "$tmp_sh" 2>&1 | head -c 80)) — NOT installed, machine has no freeze recovery"
+    else
+      [ -f /usr/local/bin/shakerview-watchdog.sh ] \
+        && cp -a /usr/local/bin/shakerview-watchdog.sh "/usr/local/bin/shakerview-watchdog.sh.bak-$(date +%Y%m%d-%H%M%S)"
+      install -m 755 -o root -g root "$tmp_sh" /usr/local/bin/shakerview-watchdog.sh
+      install -m 644 -o root -g root "$tmp_svc" /etc/systemd/system/shakerview-watchdog.service
+      systemctl daemon-reload
+      # WantedBy=graphical.target, not multi-user.target -- pairing the unit's
+      # After=graphical.target with multi-user.target forms an ordering cycle that systemd
+      # breaks by dropping the start job, leaving the watchdog dead at boot.
+      systemctl enable shakerview-watchdog >/dev/null 2>&1 \
+        || record_warning "could not enable shakerview-watchdog — it will not start at boot"
+      systemctl restart shakerview-watchdog \
+        || record_warning "shakerview-watchdog failed to start"
+      sleep 3
+      local wstate
+      wstate="$(systemctl is-active shakerview-watchdog 2>&1)"
+      if [ "$wstate" = "active" ]; then
+        log "watchdog installed and running (md5 $(md5sum /usr/local/bin/shakerview-watchdog.sh | awk '{print $1}'))"
+      else
+        record_warning "shakerview-watchdog is '$wstate' after install — no freeze recovery on this machine"
+      fi
+      # Prove it actually DETECTS faults rather than merely running. The suite feeds synthetic
+      # conditions to health_check and touches only /tmp.
+      if fetch_repo_file "watchdog/shakerview-watchdog.test.sh" "$tmp_test" >/dev/null; then
+        if bash "$tmp_test" >/tmp/wd_test_out 2>&1; then
+          log "watchdog self-test: $(grep -oE '[0-9]+ passed, [0-9]+ failed' /tmp/wd_test_out | tail -1)"
+        else
+          record_warning "watchdog SELF-TEST FAILED ($(grep -oE '[0-9]+ passed, [0-9]+ failed' /tmp/wd_test_out | tail -1)) — it runs but may not detect a real freeze"
+        fi
+        rm -f /tmp/wd_test_out
+      fi
+    fi
+  else
+    record_warning "could not obtain the watchdog script (local copy or $SCRIPTS_RAW_URL) — machine has NO freeze recovery"
+  fi
+  rm -f "$tmp_sh" "$tmp_svc" "$tmp_test"
+
+  # ---- 2. Prevention: the c-state clamp ----------------------------------------------------
+  local cpu
+  cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+  log "CPU: $cpu"
+  if ! printf '%s' "$cpu" | grep -qE "$CSTATE_CPU_PATTERN"; then
+    log "CPU is not in the freeze-prone Bay Trail set — no c-state clamp needed"
+    return 0
+  fi
+
+  if grep -q 'intel_idle.max_cstate=1' /proc/cmdline; then
+    log "c-state clamp already active on the running kernel"
+    grep -q 'intel_idle.max_cstate=1' /etc/default/grub 2>/dev/null \
+      || record_warning "c-state clamp is active now but missing from /etc/default/grub — it will be lost at the next kernel update"
+    return 0
+  fi
+
+  # An interrupted apt can leave a vmlinuz with no matching initrd. update-grub happily makes
+  # that orphan the default menu entry, and the machine kernel-panics on its next boot.
+  local orphan=0 k v
+  for k in /boot/vmlinuz-*; do
+    [ -e "$k" ] || continue
+    v="${k#/boot/vmlinuz-}"
+    [ -f "/boot/initrd.img-$v" ] || { record_warning "/boot has an orphaned kernel $v (no initrd) — SKIPPING update-grub, it would arm an unbootable default entry. Fix with: apt-get install --reinstall linux-image-$v"; orphan=1; }
+  done
+  [ "$orphan" = "1" ] && return 0
+
+  cp -a /etc/default/grub "/etc/default/grub.pre-cstate-$(date +%Y%m%d-%H%M%S)"
+  if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
+    sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 intel_idle.max_cstate=1"/' /etc/default/grub
+  else
+    printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_idle.max_cstate=1"\n' >>/etc/default/grub
+  fi
+
+  if ! grep -q 'intel_idle.max_cstate=1' /etc/default/grub; then
+    record_warning "failed to add intel_idle.max_cstate=1 to /etc/default/grub — this Bay Trail machine stays freeze-prone"
+    return 0
+  fi
+  if update-grub >/dev/null 2>&1 && grep -q 'intel_idle.max_cstate=1' /boot/grub/grub.cfg; then
+    CSTATE_REBOOT_REQUIRED=1
+    log "c-state clamp written to GRUB — takes effect on the next reboot"
+  else
+    record_warning "update-grub did not apply the c-state clamp — check /boot/grub/grub.cfg by hand"
   fi
 }
 
@@ -1802,6 +1934,7 @@ main() {
 
   install_base_packages
   disable_auto_updates
+  install_freeze_protection
   configure_ssh
   install_ops_ssh_key
   reinstall_anydesk
@@ -1894,6 +2027,11 @@ main() {
   fi
   echo "Log file          : $LOGFILE"
   echo "Readiness verdict : $READINESS_VERDICT${READINESS_REPORT:+  (report: $READINESS_REPORT)}"
+  if [ "$CSTATE_REBOOT_REQUIRED" = "1" ]; then
+    echo
+    echo "ACTION REQUIRED: this is a Bay Trail CPU and the c-state clamp was just written to GRUB."
+    echo "                 It is INERT until you reboot. Freeze prevention starts after: sudo reboot"
+  fi
   if [ -n "$reg_code" ] && [ -z "$machine_key" ]; then
     echo
     echo "Remaining manual step: enter '$reg_code' on-device via Service Menu > Telemetry > Activation key, then restart ShakerView."

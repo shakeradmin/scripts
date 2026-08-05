@@ -1,0 +1,16 @@
+[Unit]
+Description=ShakerView freeze watchdog (graduated recovery ladder)
+After=graphical.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/shakerview-watchdog.sh
+Restart=always
+RestartSec=30
+
+[Install]
+# graphical.target, NOT multi-user.target: the unit is ordered After=graphical.target, and
+# graphical.target is itself ordered after multi-user.target -- pairing that After= with
+# WantedBy=multi-user.target forms an ordering cycle that systemd breaks by silently dropping
+# the start job ("Job ... deleted to break ordering cycle"), leaving the watchdog dead at boot.
+WantedBy=graphical.target

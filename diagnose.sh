@@ -294,10 +294,19 @@ if [ -f "$WDOG" ]; then
   fi
   bash -n "$WDOG" 2>/dev/null && ok watchdog.syntax "watchdog script parses" \
                               || fail watchdog.syntax "watchdog script has a SYNTAX ERROR — it dies at first execution"
-  # The smoking gun: a broken watchdog announces itself here every cycle.
-  CNF="$(journalctl -u shakerview-watchdog --since '-60min' --no-pager 2>/dev/null | grep -c 'command not found')"
-  [ "${CNF:-0}" -gt 0 ] && fail watchdog.runtime "watchdog logged $CNF 'command not found' errors in the last hour — it is a no-op" \
-                        || ok watchdog.runtime "no watchdog runtime errors in the last hour"
+  # The smoking gun: a broken watchdog announces itself here every cycle. Count only since the
+  # RUNNING unit started — a fixed lookback window keeps reporting a repaired watchdog as broken
+  # for an hour after the fix, which trains people to ignore the check.
+  WSTART="$(systemctl show -p ActiveEnterTimestamp --value shakerview-watchdog 2>/dev/null)"
+  if [ -n "$WSTART" ]; then
+    CNF="$(journalctl -u shakerview-watchdog --since "$WSTART" --no-pager 2>/dev/null | grep -c 'command not found')"
+    WSCOPE="since the unit started ($WSTART)"
+  else
+    CNF="$(journalctl -u shakerview-watchdog --since '-60min' --no-pager 2>/dev/null | grep -c 'command not found')"
+    WSCOPE="in the last hour"
+  fi
+  [ "${CNF:-0}" -gt 0 ] && fail watchdog.runtime "watchdog logged $CNF 'command not found' errors $WSCOPE — it is a no-op" \
+                        || ok watchdog.runtime "no watchdog runtime errors $WSCOPE"
   WACT="$(systemctl is-active shakerview-watchdog 2>/dev/null)"
   WNR="$(systemctl show -p NRestarts --value shakerview-watchdog 2>/dev/null)"
   [ "$WACT" = "active" ] && ok watchdog.unit "shakerview-watchdog active (NRestarts=${WNR:-0})" \
