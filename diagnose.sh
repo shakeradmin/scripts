@@ -1,44 +1,82 @@
 #!/usr/bin/env bash
-# diagnose.sh — pre-shipment diagnosis for machines cloned from a GOLDEN SSD.
+# diagnose.sh — the acceptance gate for a machine, in two directions.
 #
 # WHY THIS EXISTS
-#   bootstrap.sh provisions ONE machine from scratch (SSH/AnyDesk/RustDesk/Tailscale +
-#   Strapi registration + telemetry REG-code redemption). But the real shipping workflow
-#   clones a "golden" SSD and drops it into many machines. A clone is a byte-for-byte copy,
-#   so every clone inherits the golden master's IDENTITY: its telemetry MachineKey, its
-#   Tailscale node, its SSH host keys, its AnyDesk/RustDesk ID, its systemd machine-id.
-#   Shipping those unchanged is the exact "one machine has another machine's credentials"
-#   failure that caused the week-long telemetry impersonation incident (2026-06-30).
+#   Provisioning writes machine state into five independent places: the on-box Config
+#   (hard_settings/telemetry/fleet.json), the Strapi machine record, Keycloak, the
+#   manage.ishakerusa.com machine list, and Tailscale. Nothing reconciles them, so a
+#   half-finished bootstrap produces a machine that LOOKS provisioned. Every field failure
+#   this fleet has had was a partial success that reported success.
 #
-#   check_machine.sh already audits the on-box CONFIG (prices, locale, timezone, remains,
-#   wizard). This script does the two things it does NOT:
-#     1. IDENTITY RESIDUE — detect golden-master identity a clone must have regenerated.
-#     2. LIVE SHAKERVIEW   — authenticate to the machine's own telemetry backend
-#        (Keycloak client_credentials as the machine) and pull machineInfo / cells /
-#        remains / prices, so you see what the SERVER sees before the box leaves.
+#   This script is the single answer to "is this machine actually shippable". It is
+#   READ-ONLY, and it is meant to be run by a machine, not remembered by a person:
+#     - bootstrap.sh runs it as its last act and refuses to claim success if it fails
+#     - fleetpulse runs it with --json every sweep and records the verdict in Strapi
+#     - you run it by hand before a box leaves the building
 #
-#   READ-ONLY. Changes nothing. Run BOTH scripts before shipping.
+# TWO MODES — these ask OPPOSITE questions, which is why one script with one default
+# was useless as a shipping gate and quietly stopped being run:
+#
+#   --mode unit      (DEFAULT) "is this provisioned machine ready to ship?"
+#                    Identity must be PRESENT and COHERENT. A missing MachineKey is a
+#                    failure. This is the mode that matters for shipping.
+#
+#   --mode preclone  "is this golden master safe to clone?"
+#                    Identity must be ABSENT. A present MachineKey is a failure, because
+#                    every clone would inherit it — the shape of the 2026-06-30 week-long
+#                    telemetry impersonation incident.
+#
+#   Running unit-mode checks against a golden (or preclone against a real unit) inverts
+#   every identity verdict. The mode is printed in the header; read it before believing
+#   the output.
 #
 # USAGE
-#   bash diagnose.sh 100.100.239.36      # from your laptop: SSH in, run remotely
-#   bash diagnose.sh                     # on the machine itself: run locally
-#   GOLDEN_MACHINE_ID=<strapi_id> bash diagnose.sh <ip>   # compare identity vs a known golden
+#   bash diagnose.sh 100.100.239.36                 # SSH in and check a remote unit
+#   bash diagnose.sh                                # on the machine itself
+#   bash diagnose.sh --mode preclone                # golden master, before cloning
+#   bash diagnose.sh 100.x.x.x --json               # machine-readable, for fleetpulse
+#   GOLDEN_MACHINE_ID=<strapi_id> bash diagnose.sh <ip>
 #
 # ENV OVERRIDES (all optional; auto-detected from on-box config when unset)
 #   SV_SERIAL, SV_MACHINE_KEY, SV_KK_ADDRESS, SV_KK_REALM, SV_WS_ADDRESS
 #   SKIP_SHAKERVIEW=1   skip the live telemetry pull (identity + OS checks only)
+#   FW_TARGET           expected controller firmware (default 260310-03, fleet-wide target)
 #
-# MARKERS  [ OK ] fine | [WARN] check/fix | [FAIL] must fix before client | [INFO] data only
-# Exits 0 clean, 1 if any WARN (no FAIL), 2 if any FAIL. Never aborts mid-run.
+# OUTPUT
+#   Human: [ OK ] fine | [WARN] check/fix | [FAIL] must fix before client | [INFO] data
+#   --json: {schema, mode, verdict, counts, checks:[{id,level,msg}]} on stdout,
+#           human lines on stderr. Check ids are STABLE — fleetpulse tracks drift by id.
+#   Exit 0 clean, 1 if any WARN (no FAIL), 2 if any FAIL. Never aborts mid-run.
 
-HOST="${1:-}"
+MODE="unit"
+JSON=0
+HOST=""
+for a in "$@"; do
+  case "$a" in
+    --mode=*)   MODE="${a#--mode=}" ;;
+    --json)     JSON=1 ;;
+    --preclone) MODE="preclone" ;;
+    --unit)     MODE="unit" ;;
+    -*)         ;;
+    *)          [ -z "$HOST" ] && HOST="$a" ;;
+  esac
+done
+# support "--mode unit" (space form)
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--mode" ] && MODE="$a"
+  prev="$a"
+done
+case "$MODE" in unit|preclone) ;; *) echo "bad --mode '$MODE' (unit|preclone)" >&2; exit 3;; esac
+
 if [[ -n "$HOST" && "$HOST" != "local" ]]; then
-  # Forward the relevant env through SSH, then stream this script to the remote shell.
-  exec ssh -o ConnectTimeout=12 "shaker@$HOST" \
+  # Forward env + flags through SSH, then stream this script to the remote shell.
+  exec ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=no "shaker@$HOST" \
     "SKIP_SHAKERVIEW='${SKIP_SHAKERVIEW:-}' GOLDEN_MACHINE_ID='${GOLDEN_MACHINE_ID:-}' \
      SV_SERIAL='${SV_SERIAL:-}' SV_MACHINE_KEY='${SV_MACHINE_KEY:-}' \
      SV_KK_ADDRESS='${SV_KK_ADDRESS:-}' SV_KK_REALM='${SV_KK_REALM:-}' \
-     SV_WS_ADDRESS='${SV_WS_ADDRESS:-}' bash -s" < "$0"
+     SV_WS_ADDRESS='${SV_WS_ADDRESS:-}' FW_TARGET='${FW_TARGET:-}' \
+     bash -s -- --mode=$MODE $([ "$JSON" = "1" ] && echo --json)" < "$0"
   exit $?
 fi
 
@@ -50,174 +88,407 @@ DATA="$ACTIVE/ShakerView2.0_Data"
 CFG="$DATA/Config"
 HS="$CFG/hard_settings.json"
 TJ="$CFG/telemetry.json"
-CJ="$CFG/config.json"
+FJ="$CFG/fleet.json"
+DIAGLOG="/home/shaker/ShakerView-diag/patch-diag.log"
+WDOG="/usr/local/bin/shakerview-watchdog.sh"
+FW_TARGET="${FW_TARGET:-260310-03}"
 
+REC="$(mktemp)"
+trap 'rm -f "$REC"' EXIT
 nOK=0; nWARN=0; nFAIL=0
-ok(){   printf '[ OK ] %s\n' "$1"; nOK=$((nOK+1)); }
-warn(){ printf '[WARN] %s\n' "$1"; nWARN=$((nWARN+1)); }
-fail(){ printf '[FAIL] %s\n' "$1"; nFAIL=$((nFAIL+1)); }
-info(){ printf '[INFO] %s\n' "$1"; }
-hdr(){  printf '\n=== %s ===\n' "$1"; }
+
+# Human output goes to stderr in --json mode so stdout stays pure JSON.
+say(){ if [ "$JSON" = "1" ]; then printf '%s\n' "$1" >&2; else printf '%s\n' "$1"; fi; }
+_rec(){ printf '%s\t%s\t%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\t\n' '  ')" >>"$REC"; }
+ok(){   _rec OK   "$1" "$2"; say "[ OK ] $2"; nOK=$((nOK+1)); }
+warn(){ _rec WARN "$1" "$2"; say "[WARN] $2"; nWARN=$((nWARN+1)); }
+fail(){ _rec FAIL "$1" "$2"; say "[FAIL] $2"; nFAIL=$((nFAIL+1)); }
+info(){ _rec INFO "$1" "$2"; say "[INFO] $2"; }
+hdr(){  say ""; say "=== $1 ==="; }
 
 # Pull a "key": value / "key": "value" out of a JSON file without needing jq.
 jget(){ grep -oE "\"$2\": *\"?[^\",}]*\"?" "$1" 2>/dev/null | head -1 | sed -E "s/.*\"$2\": *\"?([^\",}]*)\"?.*/\1/"; }
 
-echo "############ diagnose.sh — $(hostname) — $(date) ############"
-echo "Read-only pre-shipment diagnosis (golden-SSD clone). Pair with check_machine.sh."
+say "############ diagnose.sh — $(hostname) — $(date) ############"
+say "MODE=$MODE  (unit = ready to ship? | preclone = safe to clone?)"
 
 # ---------------------------------------------------------------------------
-hdr "1. CLONE IDENTITY RESIDUE  (each clone MUST regenerate these — else impersonation)"
+hdr "1. IDENTITY  (mode decides whether presence is right or wrong)"
 # ---------------------------------------------------------------------------
-# 1.1 systemd machine-id — shared machine-id => DHCP lease / dbus / journald collisions.
+# 1.1 systemd machine-id
 MID="$(cat /etc/machine-id 2>/dev/null)"
 DBID="$(cat /var/lib/dbus/machine-id 2>/dev/null)"
-if [ -z "$MID" ]; then
-  ok "/etc/machine-id empty — will be regenerated uniquely on next boot (correct pre-clone state)"
+if [ "$MODE" = "preclone" ]; then
+  if [ -z "$MID" ]; then
+    ok identity.machineid "/etc/machine-id empty — regenerated uniquely on next boot (correct pre-clone state)"
+  else
+    info identity.machineid "machine-id: $MID"
+    warn identity.machineid "machine-id is POPULATED — every clone will share it. Before cloning: sudo truncate -s0 /etc/machine-id /var/lib/dbus/machine-id"
+  fi
 else
-  info "machine-id: $MID"
-  warn "machine-id is POPULATED — every clone will share it. Before cloning golden, run: sudo truncate -s0 /etc/machine-id /var/lib/dbus/machine-id"
+  [ -n "$MID" ] && ok identity.machineid "machine-id present ($MID)" \
+                || fail identity.machineid "machine-id EMPTY on a unit — DHCP/dbus/journald identity is unset until reboot"
 fi
-[ -n "$MID" ] && [ -n "$DBID" ] && [ "$MID" != "$DBID" ] && warn "/etc/machine-id != /var/lib/dbus/machine-id (dbus mismatch)"
+[ -n "$MID" ] && [ -n "$DBID" ] && [ "$MID" != "$DBID" ] && warn identity.dbusid "/etc/machine-id != /var/lib/dbus/machine-id (dbus mismatch)"
 
-# 1.2 SSH host keys — clones sharing host keys => identical fingerprints, MITM-warning noise, security risk.
+# 1.2 SSH host keys
 HKEYS="$(ls /etc/ssh/ssh_host_*_key.pub 2>/dev/null)"
-if [ -n "$HKEYS" ]; then
-  for k in $HKEYS; do info "ssh host key: $(ssh-keygen -lf "$k" 2>/dev/null | awk '{print $2, $4}')"; done
-  warn "SSH host keys present — all clones will share them. Regenerate per unit: sudo rm /etc/ssh/ssh_host_* && sudo dpkg-reconfigure openssh-server"
+if [ "$MODE" = "preclone" ]; then
+  if [ -n "$HKEYS" ]; then
+    for k in $HKEYS; do info identity.sshkeys "ssh host key: $(ssh-keygen -lf "$k" 2>/dev/null | awk '{print $2, $4}')"; done
+    warn identity.sshkeys "SSH host keys present — clones share them. Regenerate per unit: sudo rm /etc/ssh/ssh_host_* && sudo ssh-keygen -A"
+  else
+    ok identity.sshkeys "No SSH host keys on disk — regenerated per unit on first boot"
+  fi
 else
-  ok "No SSH host keys on disk — regenerated per unit on first boot"
+  # Never scrub these on a live unit without ssh-keygen -A: socket-activated sshd then
+  # refuses every connection and the box is only reachable physically.
+  [ -n "$HKEYS" ] && ok identity.sshkeys "SSH host keys present ($(echo "$HKEYS" | wc -l) keys) — sshd can accept connections" \
+                  || fail identity.sshkeys "NO SSH host keys — sshd will refuse every connection. Fix: sudo ssh-keygen -A && sudo systemctl restart ssh"
 fi
 
-# 1.3 Tailscale node identity — a clone with golden's state logs in AS the golden node (flapping IP, wrong routing).
+# 1.3 Tailscale node identity
 if command -v tailscale >/dev/null 2>&1; then
   TSSTATE="/var/lib/tailscale/tailscaled.state"
   TSHOST="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin);print((d.get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null)"
   TSIP="$(tailscale ip -4 2>/dev/null | head -1)"
-  if [ -s "$TSSTATE" ]; then
-    info "Tailscale logged in as: ${TSHOST:-?}  ip=${TSIP:-?}"
-    warn "tailscaled.state present — clone will re-use golden's node identity. Reset per unit: sudo tailscale logout && sudo rm -f $TSSTATE  (then bootstrap re-joins with its own authkey)"
+  if [ "$MODE" = "preclone" ]; then
+    # tailscaled.state is root-only (0600). A plain `[ -s ]` as the shaker user always fails,
+    # which silently reported a dirty golden as clean — the worst possible direction for this
+    # check to be wrong. Decide only when we can actually see the file.
+    if sudo -n test -s "$TSSTATE" 2>/dev/null || [ -s "$TSSTATE" ]; then
+      info identity.tailscale "Tailscale logged in as: ${TSHOST:-?} ip=${TSIP:-?}"
+      warn identity.tailscale "tailscaled.state present — clone re-uses golden's node identity. Reset: sudo tailscale logout && sudo rm -f $TSSTATE"
+    elif sudo -n true 2>/dev/null || [ -r "$(dirname "$TSSTATE")" ]; then
+      ok identity.tailscale "No tailscaled.state — clone joins Tailscale fresh"
+    elif [ -n "$TSIP" ]; then
+      warn identity.tailscale "cannot read $TSSTATE (needs sudo) but Tailscale IS logged in as ${TSHOST:-?} — assume node identity is present and must be reset before cloning"
+    else
+      warn identity.tailscale "cannot read $TSSTATE (needs sudo) — Tailscale clone-identity state UNVERIFIED; re-run with sudo before trusting this golden"
+    fi
   else
-    ok "No tailscaled.state — clone joins Tailscale fresh"
+    if [ -n "$TSIP" ]; then
+      ok identity.tailscale "Tailscale up as ${TSHOST:-?} ip=$TSIP"
+    else
+      fail identity.tailscale "Tailscale not connected — fleet tooling (fleetpulse/fleetpatch/fleetfirmware) cannot reach this machine at all"
+    fi
   fi
 else
-  info "tailscale not installed"
+  info identity.tailscale "tailscale not installed"
 fi
 
-# 1.4 Remote-access IDs carried in the image (AnyDesk / RustDesk).
-if command -v anydesk >/dev/null 2>&1; then
-  AD="$(anydesk --get-id 2>/dev/null | tr -d '[:space:]')"
-  [ -n "$AD" ] && { info "AnyDesk ID (from image): $AD"; warn "AnyDesk ID baked into image — clones share one ID (only one connectable at a time). bootstrap reinstalls AnyDesk to mint a fresh ID; confirm it ran."; } || ok "AnyDesk installed, no ID yet"
-fi
-if command -v rustdesk >/dev/null 2>&1; then
-  RD="$(rustdesk --get-id 2>/dev/null | tr -d '[:space:]')"
-  [ -n "$RD" ] && { info "RustDesk ID (from image): $RD"; warn "RustDesk ID baked into image — same caveat as AnyDesk."; } || ok "RustDesk installed, no ID yet"
-fi
+# 1.4 Remote-access IDs
+for tool in anydesk rustdesk; do
+  command -v "$tool" >/dev/null 2>&1 || continue
+  ID="$("$tool" --get-id 2>/dev/null | tr -d '[:space:]')"
+  if [ "$MODE" = "preclone" ]; then
+    [ -n "$ID" ] && warn "identity.$tool" "$tool ID baked into image ($ID) — clones share one ID. bootstrap reinstalls it to mint a fresh one; confirm that ran." \
+                 || ok "identity.$tool" "$tool installed, no ID yet"
+  else
+    [ -n "$ID" ] && ok "identity.$tool" "$tool ID: $ID" \
+                 || warn "identity.$tool" "$tool installed but has no ID — no remote support path to this machine"
+  fi
+done
 
-# 1.5 THE BIG ONE: ShakerView telemetry identity. Two clones with the same MachineKey = the 2026-06-30 incident.
+# 1.5 THE BIG ONE: telemetry identity.
 SERIAL_HS="$(jget "$HS" MachineSerial)"
 MK="$(jget "$TJ" MachineKey)"
 MMID="$(jget "$TJ" MachineId)"
 ORGID="$(jget "$TJ" OrganizationId)"
-info "telemetry identity — MachineSerial=${SERIAL_HS:-?} MachineId=${MMID:-?} OrganizationId=${ORGID:-?}"
-if [ -n "$MK" ]; then
-  MKFP="$(printf '%s' "$MK" | sha256sum | cut -c1-12)"
-  info "MachineKey present (sha256:$MKFP…) — this is a live per-machine secret"
-  fail "telemetry.json carries a MachineKey from the golden master. If this clone ships WITHOUT re-registration it will IMPERSONATE the golden machine on the telemetry backend (2026-06-30 incident shape). Each unit must get its own REG-code redemption (bootstrap does this) OR have telemetry.json's MachineKey/MachineId cleared before cloning."
+info identity.telemetry "telemetry identity — MachineSerial=${SERIAL_HS:-?} MachineId=${MMID:-?} OrganizationId=${ORGID:-?}"
+if [ "$MODE" = "preclone" ]; then
+  if [ -n "$MK" ]; then
+    fail identity.machinekey "telemetry.json carries a MachineKey. Cloning this ships N machines with ONE identity — they impersonate each other on the backend (2026-06-30 incident). Clear MachineKey/MachineId before cloning."
+  else
+    ok identity.machinekey "telemetry.json has no MachineKey — clone is clean, registers per unit"
+  fi
 else
-  ok "telemetry.json has no MachineKey — clone is clean, will register per unit"
+  if [ -n "$MK" ]; then
+    ok identity.machinekey "telemetry.json has a MachineKey (sha256:$(printf '%s' "$MK" | sha256sum | cut -c1-12)…)"
+  else
+    fail identity.machinekey "NO MachineKey — this machine is not registered; ShakerView will never authenticate telemetry"
+  fi
+  [ -z "$SERIAL_HS" ] && fail identity.serial "hard_settings.MachineSerial is EMPTY — Keycloak client_id is unset, telemetry will 401"
 fi
 
-# 1.6 Leftover provisioning artifacts / secrets from the golden build.
+# 1.6 Leftover provisioning artifacts / secrets.
 LEFT=0
 for f in /home/shaker/bootstrap_device_*.log /home/shaker/bootstrap-credentials-*.txt /home/shaker/.env /home/shaker/Desktop/.env; do
-  ls $f >/dev/null 2>&1 && { warn "leftover on image: $f (remove before cloning — contains keys/creds)"; LEFT=1; }
+  ls $f >/dev/null 2>&1 && { warn identity.leftovers "leftover secret/log on disk: $f (must not ship or be cloned)"; LEFT=1; }
 done
-BH="/home/shaker/.bash_history"
-[ -s "$BH" ] && { info "bash_history has $(wc -l <"$BH" 2>/dev/null) lines — scrub if it contains passwords/tokens"; }
-[ "$LEFT" = "0" ] && ok "No stray bootstrap logs / credential files in home"
+[ "$LEFT" = "0" ] && ok identity.leftovers "No stray bootstrap logs / credential files in home"
 
-# 1.7 Saved Wi-Fi profiles (office SSID + PSK) that ship with the image.
+# 1.7 Saved Wi-Fi profiles
 if command -v nmcli >/dev/null 2>&1; then
   WIFIS="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 ~ /wireless/ {print $1}')"
   if [ -n "$WIFIS" ]; then
-    info "saved Wi-Fi profiles baked in: $(echo "$WIFIS" | tr '\n' ' ')"
-    warn "office Wi-Fi profile(s) ship inside the image (PSK stored in /etc/NetworkManager). Fine if intended; delete if the office SSID shouldn't leave the building."
+    warn identity.wifi "office Wi-Fi profile(s) stored in image: $(echo "$WIFIS" | tr '\n' ' ')— PSK travels with the box; delete if the office SSID shouldn't leave the building"
   else
-    ok "No saved Wi-Fi profiles in image"
+    ok identity.wifi "No saved Wi-Fi profiles in image"
   fi
 fi
 
-# 1.8 Hostname still the golden/default name?
+# 1.8 Hostname
 HN="$(hostname)"
-info "hostname: $HN"
 case "$HN" in
-  *golden*|*template*|*master*|ubuntu|localhost) warn "hostname looks like a golden/default name — set a per-unit hostname";;
-  *) ok "hostname is not an obvious golden/default placeholder";;
+  *golden*|*template*|*master*|ubuntu|localhost) warn identity.hostname "hostname '$HN' looks like a golden/default placeholder";;
+  *) ok identity.hostname "hostname: $HN";;
 esac
 
 # ---------------------------------------------------------------------------
 hdr "2. SSD / DISK HEALTH  (you are shipping this physical disk)"
 # ---------------------------------------------------------------------------
 ROOTDEV="$(findmnt -no SOURCE / 2>/dev/null)"
-info "root device: ${ROOTDEV:-?}"
 DF="$(df -h / | awk 'NR==2{print $4" free ("$5" used)"}')"
 USEDPCT="$(df -P / | awk 'NR==2{gsub("%","",$5);print $5}')"
-info "disk /: $DF"
-[ "${USEDPCT:-0}" -ge 90 ] && fail "root disk >=90% full — clone/first-boot may fail, logs can't rotate" || ok "root disk has headroom"
+info disk.usage "root device ${ROOTDEV:-?} — $DF"
+[ "${USEDPCT:-0}" -ge 90 ] && fail disk.usage "root disk >=90% full — logs can't rotate, first boot may fail" \
+                           || ok disk.usage "root disk has headroom"
 if command -v smartctl >/dev/null 2>&1 && [ -n "$ROOTDEV" ]; then
   BASEDEV="$(lsblk -no PKNAME "$ROOTDEV" 2>/dev/null | head -1)"; [ -n "$BASEDEV" ] && BASEDEV="/dev/$BASEDEV"
   SMART="$(sudo -n smartctl -H "${BASEDEV:-$ROOTDEV}" 2>/dev/null | grep -iE 'overall-health|SMART Health')"
-  if [ -n "$SMART" ]; then echo "$SMART" | grep -qi 'PASSED' && ok "SMART health: PASSED (${BASEDEV:-$ROOTDEV})" || fail "SMART health NOT passed: $SMART"; else info "SMART not readable (need sudo/-n or no SMART on this device)"; fi
+  if [ -n "$SMART" ]; then
+    echo "$SMART" | grep -qi 'PASSED' && ok disk.smart "SMART health PASSED (${BASEDEV:-$ROOTDEV})" \
+                                     || fail disk.smart "SMART health NOT passed: $SMART"
+  else info disk.smart "SMART not readable (needs passwordless sudo, or device has no SMART)"; fi
 else
-  info "smartctl unavailable — install smartmontools to health-check the SSD before shipping"
+  info disk.smart "smartctl unavailable — install smartmontools to health-check the SSD"
 fi
 
 # ---------------------------------------------------------------------------
-hdr "3. KIOSK RUNTIME READINESS"
+hdr "3. KIOSK RUNTIME"
 # ---------------------------------------------------------------------------
 SV=$(pgrep -cf "ShakerView2.0.x86_64\$" 2>/dev/null)
 AM=$(pgrep -af "/AppManager\$" 2>/dev/null | grep -vc "sh -c")
-[ "${SV:-0}" = "1" ] && ok "ShakerView running (1 process)" || { [ "${SV:-0}" = "0" ] && warn "ShakerView NOT running" || fail "ShakerView duplicate processes: $SV"; }
-[ "${AM:-0}" = "1" ] && ok "AppManager watchdog (1)" || warn "AppManager watchdog count=$AM (1 expected; 2+ = duplicate)"
-# Autologin + autostart so the kiosk comes up unattended at the client.
-grep -rqsE '^AutomaticLogin' /etc/gdm3/custom.conf /etc/gdm/custom.conf 2>/dev/null && ok "GDM autologin configured" || warn "GDM autologin not found — kiosk won't come up unattended after power-on"
+[ "${SV:-0}" = "1" ] && ok kiosk.shakerview "ShakerView running (1 process)" \
+  || { [ "${SV:-0}" = "0" ] && fail kiosk.shakerview "ShakerView NOT running — no kiosk at the client" \
+                            || fail kiosk.shakerview "ShakerView duplicate processes: $SV"; }
+[ "${AM:-0}" = "1" ] && ok kiosk.appmanager "AppManager (1)" \
+                     || warn kiosk.appmanager "AppManager count=$AM (1 expected; 2+ = duplicate relaunch loop)"
+grep -rqsE '^AutomaticLogin' /etc/gdm3/custom.conf /etc/gdm/custom.conf 2>/dev/null \
+  && ok kiosk.autologin "GDM autologin configured" \
+  || fail kiosk.autologin "GDM autologin not found — kiosk will not come up unattended after power-on"
 NTP="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
-[ "$NTP" = "yes" ] && ok "NTP synchronized" || warn "clock not NTP-synced (fiscal receipts / sales timestamps drift)"
+[ "$NTP" = "yes" ] && ok kiosk.ntp "NTP synchronized" \
+                   || warn kiosk.ntp "clock not NTP-synced — sales timestamps drift"
 
 # ---------------------------------------------------------------------------
-hdr "4. LIVE SHAKERVIEW TELEMETRY  (machine's own backend view)"
+if [ "$MODE" = "unit" ]; then
+hdr "4. UNIT READINESS  (the checks each past field failure earned)"
+# ---------------------------------------------------------------------------
+
+# 4.1 The freeze-recovery watchdog. `systemctl is-active` is NOT evidence: the unit is a
+#     bash loop that stays "active" while every function call inside it fails. An
+#     incomplete 2026-07-29 repo edit shipped a copy with all function bodies stripped;
+#     it ran for a week on machines that had no recovery at all, silently.
+if [ -f "$WDOG" ]; then
+  MISSING=""
+  for fn in log xauth_file as_user_x sv_pid firmware_write_active health_check \
+            recover_dpms recover_restart_app recover_restart_gdm recover_reboot; do
+    grep -qE "^$fn\(\) *\{" "$WDOG" || MISSING="$MISSING $fn"
+  done
+  if [ -n "$MISSING" ]; then
+    fail watchdog.functions "shakerview-watchdog.sh is GUTTED — missing function bodies:$MISSING. It runs, logs 'command not found' every cycle, and can never recover a freeze. Redeploy from shakerview repo tools/watchdog/shakerview-watchdog.sh"
+  else
+    ok watchdog.functions "watchdog has all 10 required functions"
+  fi
+  bash -n "$WDOG" 2>/dev/null && ok watchdog.syntax "watchdog script parses" \
+                              || fail watchdog.syntax "watchdog script has a SYNTAX ERROR — it dies at first execution"
+  # The smoking gun: a broken watchdog announces itself here every cycle.
+  CNF="$(journalctl -u shakerview-watchdog --since '-60min' --no-pager 2>/dev/null | grep -c 'command not found')"
+  [ "${CNF:-0}" -gt 0 ] && fail watchdog.runtime "watchdog logged $CNF 'command not found' errors in the last hour — it is a no-op" \
+                        || ok watchdog.runtime "no watchdog runtime errors in the last hour"
+  WACT="$(systemctl is-active shakerview-watchdog 2>/dev/null)"
+  WNR="$(systemctl show -p NRestarts --value shakerview-watchdog 2>/dev/null)"
+  [ "$WACT" = "active" ] && ok watchdog.unit "shakerview-watchdog active (NRestarts=${WNR:-0})" \
+                         || fail watchdog.unit "shakerview-watchdog unit is '$WACT' — no freeze recovery"
+else
+  fail watchdog.present "no $WDOG — this machine has NO freeze recovery. A wedged kiosk stays wedged until someone drives to it."
+fi
+
+# 4.2 What is ACTUALLY in the binary. machine.patch in Strapi drifts (hand-patched boxes,
+#     machines bootstrapped after patching) — the DLL is the only honest answer, which is
+#     the same rule fleetfirmware.py already applies before arming a flash.
+CC="$DATA/Managed/CommonCode.dll"
+if [ -f "$CC" ]; then
+  info patch.md5 "CommonCode.dll md5=$(md5sum "$CC" | awk '{print $1}') size=$(stat -c%s "$CC")"
+  hasPD=$(grep -ac PatchDiag "$CC" 2>/dev/null); hasPD=${hasPD:-0}
+  hasFC=$(grep -ac FleetCatalog "$CC" 2>/dev/null); hasFC=${hasFC:-0}
+  hasFW=$(grep -ac FirmwareFlashWatchdog "$CC" 2>/dev/null); hasFW=${hasFW:-0}
+  [ "$hasPD" -gt 0 ] && ok patch.patchdiag "PatchDiag present — freeze diagnostics + FleetPatch verify will work" \
+                     || fail patch.patchdiag "NO PatchDiag in CommonCode.dll — no freeze visibility, and FleetPatch's verify() rolls back any install on this build"
+  [ "$hasFC" -gt 0 ] && ok patch.fleetcatalog "FleetCatalog present — machine pulls catalog/planogram from Strapi" \
+                     || warn patch.fleetcatalog "NO FleetCatalog — this machine cannot receive catalog or planogram updates"
+  [ "$hasFW" -gt 0 ] && ok patch.flashwatchdog "FirmwareFlashWatchdog present — unattended firmware flash is permitted" \
+                     || warn patch.flashwatchdog "NO FirmwareFlashWatchdog — fleetfirmware will REFUSE to autoflash this machine (a failed flash would wedge it with no way back). Firmware stays manual/on-site until a build with the watchdog is installed."
+else
+  fail patch.present "no CommonCode.dll at $CC — ShakerView install is not where expected"
+fi
+
+# 4.3 PatchDiag heartbeat — the only proof the app is actually rendering rather than
+#     merely running. A wedged Unity main thread keeps the process alive and 80% busy.
+if [ -f "$DIAGLOG" ]; then
+  LAST="$(grep -a heartbeat "$DIAGLOG" 2>/dev/null | tail -1)"
+  if [ -n "$LAST" ]; then
+    LTS="$(printf '%s' "$LAST" | sed -E 's/^\[([0-9-]+ [0-9:]+).*/\1/')"
+    AGE=$(( ($(date +%s) - $(date -d "$LTS" +%s 2>/dev/null || echo 0)) / 60 ))
+    DELTA="$(printf '%s' "$LAST" | grep -oE '\(\+[0-9]+\)' | tr -d '(+)')"
+    # The FIRST heartbeat of a run always reads (+0): there is no previous sample to diff
+    # against. Treating that as "wedged" fails every machine whose app has just started —
+    # including every freshly provisioned one, where bootstrap runs this gate seconds later.
+    UPMIN="$(printf '%s' "$LAST" | grep -oE '\[up=[0-9]+m\]' | grep -oE '[0-9]+')"
+    if printf '%s' "$LAST" | grep -q 'mainthread=STALLED'; then
+      fail heartbeat.state "kiosk is FROZEN RIGHT NOW: $(printf '%s' "$LAST" | grep -oE 'frames=.*')"
+    elif [ "${AGE:-999}" -gt 5 ]; then
+      warn heartbeat.state "last PatchDiag heartbeat is ${AGE}min old — app restarted, or diagnostics stopped"
+    elif [ "${DELTA:-0}" -eq 0 ] && [ "${UPMIN:-99}" -le 1 ]; then
+      info heartbeat.state "app started ${UPMIN}min ago — first heartbeat has no delta yet; re-check in a minute"
+    elif [ "${DELTA:-0}" -eq 0 ]; then
+      fail heartbeat.state "frames not advancing (+0) after ${UPMIN:-?}min uptime — main thread wedged"
+    else
+      ok heartbeat.state "heartbeat live, frames +$DELTA/min, mainthread ok"
+    fi
+  else
+    warn heartbeat.state "patch-diag.log has no heartbeat lines yet"
+  fi
+  STALLS="$(grep -ac 'mainthread=STALLED' "$DIAGLOG" 2>/dev/null)"
+  [ "${STALLS:-0}" -gt 0 ] && warn heartbeat.history "$STALLS stall events recorded in this machine's history — it has frozen before" \
+                           || ok heartbeat.history "no stall events in patch-diag history"
+  # NUL runs in the log mean the filesystem lost buffered writes: a hard power cut, not a
+  # clean shutdown. Bay Trail boxes that freeze get power-cycled by whoever is standing there.
+  NULS="$(python3 -c "print(open('$DIAGLOG','rb').read().count(b'\x00'))" 2>/dev/null)"
+  [ "${NULS:-0}" -gt 0 ] && warn heartbeat.powercut "patch-diag.log contains $NULS NUL bytes — evidence of unclean power loss (hard power-cycle), not a graceful restart" \
+                         || ok heartbeat.powercut "no unclean-shutdown damage in patch-diag.log"
+else
+  warn heartbeat.present "no $DIAGLOG — unpatched build, or PatchDiag never started"
+fi
+
+# 4.4 Platform mitigations. Bay Trail Celerons on this fleet hard-freeze without the
+#     c-state clamp (machine 25 and machine 64 both traced to it). The requirement is
+#     hardware-derived, not per-machine improvisation.
+CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+info platform.cpu "CPU: $CPU"
+if printf '%s' "$CPU" | grep -qE 'J1900|J1800|J1750|N2807|N2840|N2930'; then
+  if grep -q 'intel_idle.max_cstate=1' /proc/cmdline; then
+    ok platform.cstate "Bay Trail CPU with intel_idle.max_cstate=1 active"
+  else
+    fail platform.cstate "Bay Trail CPU ($CPU) WITHOUT intel_idle.max_cstate=1 — this exact class hard-freezes on this fleet. Add to GRUB_CMDLINE_LINUX_DEFAULT, run update-grub, reboot."
+  fi
+  # Applied-now and survives-reboot are different questions; check both.
+  grep -q 'intel_idle.max_cstate=1' /etc/default/grub 2>/dev/null \
+    && ok platform.cstate.persist "c-state clamp persisted in /etc/default/grub" \
+    || warn platform.cstate.persist "c-state clamp not in /etc/default/grub — it will be lost at the next kernel update"
+else
+  ok platform.cstate "CPU not in the freeze-prone Bay Trail set — no c-state clamp required"
+fi
+
+# 4.5 Identity coherence across stores. Bat (260511731) had hard_settings rewritten to a
+#     new serial while Strapi still held the old one and no record existed for the new.
+SERIAL_FJ="$(jget "$FJ" serial)"
+if [ -f "$FJ" ]; then
+  FTOK="$(jget "$FJ" token)"; FURL="$(jget "$FJ" url)"
+  [ -n "$FTOK" ] && ok fleet.json "fleet.json present (url=$FURL)" || fail fleet.json "fleet.json has no token — machine cannot pull catalog"
+  # Prove the credential actually works, rather than trusting that it was written.
+  if [ -n "$FTOK" ] && [ -n "$SERIAL_HS" ]; then
+    for ep in catalog planogram; do
+      CODE="$(curl -s -o /tmp/.dg.$ep -w '%{http_code}' --max-time 15 \
+              -H "Authorization: Bearer $FTOK" "$FURL/api/machines/$SERIAL_HS/$ep" 2>/dev/null)"
+      NCELL="$(python3 -c "
+import json
+try:
+    d=json.load(open('/tmp/.dg.$ep'))
+    c=d.get('cells') or (d.get('data') or {}).get('cells') or []
+    print(len(c))
+except Exception: print(-1)" 2>/dev/null)"
+      case "$CODE" in
+        200) [ "${NCELL:-0}" -gt 0 ] && ok "fleet.$ep" "/$ep returns 200 with $NCELL cells for $SERIAL_HS" \
+                                     || warn "fleet.$ep" "/$ep returns 200 but 0 cells — machine will show an empty screen at the client" ;;
+        401|403) fail "fleet.$ep" "/$ep returns $CODE — fleet.json token is rejected (machine secret written where the shared CATALOG_TOKEN was needed?)" ;;
+        404) fail "fleet.$ep" "/$ep returns 404 — no Strapi machine record for serial '$SERIAL_HS'" ;;
+        422) fail "fleet.$ep" "/$ep returns 422 — catalog data invalid (0-based cell positions / missing price)" ;;
+        *)   warn "fleet.$ep" "/$ep unreachable (HTTP ${CODE:-000}) — Strapi not reachable from this machine right now" ;;
+      esac
+      rm -f /tmp/.dg.$ep
+    done
+  fi
+else
+  fail fleet.json "no fleet.json — machine will never pull catalog or planogram"
+fi
+if [ -n "$SERIAL_FJ" ] && [ -n "$SERIAL_HS" ] && [ "$SERIAL_FJ" != "$SERIAL_HS" ]; then
+  fail identity.coherence "serial mismatch: hard_settings=$SERIAL_HS but fleet.json=$SERIAL_FJ — the machine authenticates as one identity and fetches catalog as another"
+fi
+
+# 4.6 Controller firmware against the one fleet-wide target.
+FWRAW="$(grep -hoE 'ControllerVersionAnswer[[:space:]]+[0-9A-F]{12,}' "$DATA"/Logs/*.log 2>/dev/null | tail -1 | awk '{print $2}')"
+if [ -n "$FWRAW" ]; then
+  FWVER="$(python3 -c "
+b=bytes.fromhex('$FWRAW'.strip())
+print('%02d%02d%02d-%02d'%(b[3],b[4],b[5],b[6]) if len(b)>=7 and b[:3]==b'\xd5\x06\x49' else '')" 2>/dev/null)"
+  if [ "$FWVER" = "$FW_TARGET" ]; then
+    ok firmware.version "controller firmware $FWVER (= fleet target)"
+  elif [ -n "$FWVER" ]; then
+    warn firmware.version "controller firmware $FWVER != fleet target $FW_TARGET — needs flashing (autoflash requires FirmwareFlashWatchdog, see patch.flashwatchdog)"
+  else
+    info firmware.version "controller version raw '$FWRAW' not decodable"
+  fi
+else
+  warn firmware.version "no ControllerVersionAnswer in ShakerView logs — controller never announced itself (not connected?)"
+fi
+
+# 4.7 Reboot churn. Six reboots in a day is a machine fighting something, not a healthy box.
+# `journalctl --list-boots` ignores -S/--since, so filter on the parsed start column:
+#   " -1 <bootid> Mon 2026-08-03 20:33:30 +05—Mon 2026-08-03 23:19:15 +05"
+# ISO dates compare correctly as strings.
+BOOTS="$(journalctl --list-boots --no-pager 2>/dev/null \
+         | awk -v c="$(date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S')" \
+               '($4 " " $5) > c { n++ } END { print n+0 }')"
+if [ "${BOOTS:-0}" -gt 3 ]; then
+  warn stability.reboots "$BOOTS boots in the last 24h — machine is power-cycling or crash-looping"
+else
+  ok stability.reboots "${BOOTS:-?} boots in the last 24h"
+fi
+
+fi  # end unit-only section
+
+# ---------------------------------------------------------------------------
+hdr "5. LIVE TELEMETRY  (machine's own backend view)"
 # ---------------------------------------------------------------------------
 if [ "${SKIP_SHAKERVIEW:-}" = "1" ]; then
-  info "SKIP_SHAKERVIEW=1 — skipping live telemetry pull"
+  info telemetry.skipped "SKIP_SHAKERVIEW=1 — skipping live telemetry pull"
 else
   SERIAL="${SV_SERIAL:-$SERIAL_HS}"
   MACHINE_KEY="${SV_MACHINE_KEY:-$MK}"
   KK="${SV_KK_ADDRESS:-$(jget "$HS" KKAddress)}"; KK="${KK:-$(jget "$TJ" KKAddress)}"
-  KKREALM="${SV_KK_REALM:-$(jget "$HS" KKRealm)}"; KKREALM="${KKREALM:-shaker-realm}"
+  # The MACHINE authenticates as itself in machine-realm (client_id == hard_settings.MachineSerial),
+  # which is what bootstrap's TELEMETRY_KEYCLOAK_TOKEN_URL uses and what ShakerView actually does.
+  # The configs carry no KKRealm key at all, so the old `shaker-realm` fallback made this check
+  # report invalid_client on machines whose telemetry was perfectly fine.
+  KKREALM="${SV_KK_REALM:-$(jget "$HS" KKRealm)}"; KKREALM="${KKREALM:-machine-realm}"
   WS="${SV_WS_ADDRESS:-$(jget "$HS" WebSocketAddress)}"; WS="${WS:-$(jget "$TJ" WebSocketAddress)}"
-  info "endpoint: KK=${KK:-?} realm=$KKREALM  WS=${WS:-?}  client_id=${SERIAL:-?}"
+  info telemetry.endpoint "KK=${KK:-?} realm=$KKREALM WS=${WS:-?} client_id=${SERIAL:-?}"
 
   if [ -z "$SERIAL" ] || [ -z "$MACHINE_KEY" ] || [ -z "$KK" ] || [ -z "$WS" ]; then
-    warn "missing serial/MachineKey/KKAddress/WebSocketAddress — cannot reach the telemetry backend (set SV_* env to override, or the box isn't registered yet)"
+    [ "$MODE" = "unit" ] \
+      && fail telemetry.config "missing serial/MachineKey/KKAddress/WebSocketAddress — machine cannot reach its telemetry backend" \
+      || info telemetry.config "no telemetry identity (expected on a clean golden)"
   else
-    # 4.1 Keycloak client_credentials — proves the machine's identity is valid & registered.
     TOKRESP="$(curl -sS --max-time 12 "$KK/realms/$KKREALM/protocol/openid-connect/token" \
       --data-urlencode grant_type=client_credentials \
       --data-urlencode "client_id=$SERIAL" \
       --data-urlencode "client_secret=$MACHINE_KEY" \
       --data-urlencode scope=profile 2>/dev/null)"
-    ACCESS="$(printf '%s' "$TOKRESP" | python3 -c 'import json,sys;
+    ACCESS="$(printf '%s' "$TOKRESP" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("access_token","") or "")
 except Exception: print("")' 2>/dev/null)"
     if [ -z "$ACCESS" ]; then
-      fail "Keycloak auth FAILED as client_id=$SERIAL — machine not registered or MachineKey wrong. Backend will reject it at the client site. Resp: $(printf '%s' "$TOKRESP" | head -c 160)"
+      fail telemetry.auth "Keycloak auth FAILED as client_id=$SERIAL — not registered, or MachineKey/MachineSerial mismatch. Backend rejects it at the client site. Resp: $(printf '%s' "$TOKRESP" | head -c 160)"
     else
-      ok "Keycloak client_credentials OK — machine authenticates to backend as itself"
+      ok telemetry.auth "Keycloak client_credentials OK — machine authenticates as itself"
 
-      # 4.2 One short-lived WebSocket per request (single req/response then close — collision-safe
-      #     per the mcp_shakerview safety model). Pure-stdlib RFC6455 client, no pip deps.
-      SV_QUERY="$ACCESS|$SERIAL|$WS" python3 - <<'PY'
-import base64, json, os, socket, ssl, struct, sys, time
+      # One short-lived WebSocket per request (single req/response then close), so this never
+      # collides with the machine's own live connection.
+      PYOUT="$(SV_QUERY="$ACCESS|$SERIAL|$WS" python3 - <<'PY' 2>/dev/null
+import base64, json, os, socket, ssl, struct, time
 from urllib.parse import urlparse
 
 access, serial, ws = os.environ["SV_QUERY"].split("|", 2)
@@ -226,7 +497,6 @@ host = u.hostname; port = u.port or (443 if u.scheme == "wss" else 80)
 path = u.path or "/"
 
 def ws_request(msg_type, body=None, expect=None, timeout=10):
-    """Open ws, send one message, return first frame whose 'type' is in expect, then close."""
     expect = expect or {msg_type}
     s = socket.create_connection((host, port), timeout=8)
     if u.scheme == "wss":
@@ -236,9 +506,7 @@ def ws_request(msg_type, body=None, expect=None, timeout=10):
            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
            f"Authorization: Bearer {access}\r\n\r\n")
     s.sendall(req.encode())
-    # read handshake headers
-    buf = b""
-    s.settimeout(8)
+    buf = b""; s.settimeout(8)
     while b"\r\n\r\n" not in buf:
         chunk = s.recv(4096)
         if not chunk: raise RuntimeError("handshake closed")
@@ -246,14 +514,12 @@ def ws_request(msg_type, body=None, expect=None, timeout=10):
     if b" 101 " not in buf.split(b"\r\n", 1)[0]:
         raise RuntimeError("no 101: " + buf.split(b"\r\n",1)[0].decode("latin1"))
     payload = json.dumps({"type": msg_type, "clientId": serial, **({"body": body} if body is not None else {})}).encode()
-    # client->server frame must be masked (opcode 0x1 text, FIN)
     hdr = bytearray([0x81]); n = len(payload); mask = os.urandom(4)
     if n < 126: hdr.append(0x80 | n)
     elif n < 65536: hdr.append(0x80 | 126); hdr += struct.pack(">H", n)
     else: hdr.append(0x80 | 127); hdr += struct.pack(">Q", n)
     hdr += mask
     s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
-    # read server frames (unmasked) until a matching type or timeout
     deadline = time.time() + timeout
     rbuf = b""
     def recvn(nbytes):
@@ -272,7 +538,7 @@ def ws_request(msg_type, body=None, expect=None, timeout=10):
             if ln == 126: ln = struct.unpack(">H", recvn(2))[0]
             elif ln == 127: ln = struct.unpack(">Q", recvn(8))[0]
             data = recvn(ln) if ln else b""
-            if (b0 & 0x0F) == 0x8: break  # close
+            if (b0 & 0x0F) == 0x8: break
             try: msg = json.loads(data.decode("utf-8"))
             except Exception: continue
             if msg.get("type") in expect: return msg
@@ -281,46 +547,36 @@ def ws_request(msg_type, body=None, expect=None, timeout=10):
         except Exception: pass
     return None
 
-def out(m, level, text): print(f"::{level}::{m}: {text}")
+def out(m, level, text): print(f"::{level}::{m}::{text}")
 
 try:
     mi = ws_request("machineInfo")
-    if mi is None: out("machineInfo","WARN","no response (backend reachable but silent)")
-    else:
-        st = None
-        # status color may ride on machineInfo or a status topic; probe status too
-        out("machineInfo","OK", json.dumps(mi.get("body", mi))[:200])
+    if mi is None: out("machineinfo","WARN","no response (backend reachable but silent)")
+    else: out("machineinfo","OK", json.dumps(mi.get("body", mi))[:200])
     stt = ws_request("machineInfo", expect={"statusMachineImportTopic"}, timeout=6)
     if stt:
         c = (stt.get("body") or {}).get("color","")
         lvl = {"SUCCESS":"OK","WARNING":"WARN","ERROR":"FAIL"}.get(str(c).upper(),"INFO")
         out("status", lvl, f"{(stt.get('body') or {}).get('text','')} [{c}]")
 except Exception as e:
-    out("machineInfo","WARN", f"telemetry query error: {e}")
+    out("machineinfo","WARN", f"telemetry query error: {e}")
 
-# cells / remains / prices — presence & sanity
 try:
     cs = ws_request("cellStoreRequestExport", expect={"cellStoreRequestExport","cellStoreImportTopic"})
     if cs:
-        body = cs.get("body") or {}
-        cells = body.get("cells") or []
-        out("cellStore","OK" if cells else "WARN", f"{len(cells)} cells configured")
-    else:
-        out("cellStore","WARN","no cell config returned")
-except Exception as e:
-    out("cellStore","WARN", f"{e}")
+        cells = (cs.get("body") or {}).get("cells") or []
+        out("cellstore","OK" if cells else "WARN", f"{len(cells)} cells configured")
+    else: out("cellstore","WARN","no cell config returned")
+except Exception as e: out("cellstore","WARN", str(e))
 
 try:
     cv = ws_request("cellVolumeExport", expect={"cellVolumeExport","cellVolumeImportTopic"})
     if cv:
-        body = cv.get("body") or {}
-        cells = body.get("cells") or []
+        cells = (cv.get("body") or {}).get("cells") or []
         zero = sum(1 for c in cells if (c.get("currentValue") in (0,0.0,None)))
         out("remains","OK" if cells else "WARN", f"{len(cells)} cells, {zero} at zero/empty")
-    else:
-        out("remains","WARN","no remains returned (inventory may be uninitialized)")
-except Exception as e:
-    out("remains","WARN", f"{e}")
+    else: out("remains","WARN","no remains returned (inventory uninitialized)")
+except Exception as e: out("remains","WARN", str(e))
 
 try:
     ks = ws_request("getKioskCellsTopic", expect={"importCellKiosk"})
@@ -329,29 +585,59 @@ try:
         if isinstance(cells, dict): cells = cells.get("cells", [])
         prices = [c.get("price") for c in cells if isinstance(c, dict)]
         bad = [p for p in prices if p in (0,0.0,50,50.0,100,100.0)]
-        out("kioskPrices","FAIL" if bad else ("OK" if prices else "WARN"),
+        out("kioskprices","FAIL" if bad else ("OK" if prices else "WARN"),
             f"{len(prices)} priced cells; suspicious(0/50/100)={len(bad)}")
-except Exception as e:
-    out("kioskPrices","WARN", f"{e}")
+except Exception as e: out("kioskprices","WARN", str(e))
 PY
+      )"
+      # Fold the python sub-checks into the same counters/JSON as everything else. The old
+      # version printed them loose, so they never affected the verdict.
+      while IFS= read -r line; do
+        case "$line" in
+          ::*)
+            L="$(printf '%s' "$line" | awk -F'::' '{print $2}')"
+            I="$(printf '%s' "$line" | awk -F'::' '{print $3}')"
+            M="$(printf '%s' "$line" | awk -F'::' '{for(i=4;i<=NF;i++) printf "%s%s", $i, (i<NF?"::":"")}')"
+            case "$L" in
+              OK)   ok   "telemetry.$I" "$M" ;;
+              WARN) warn "telemetry.$I" "$M" ;;
+              FAIL) fail "telemetry.$I" "$M" ;;
+              *)    info "telemetry.$I" "$M" ;;
+            esac ;;
+        esac
+      done <<< "$PYOUT"
     fi
   fi
 fi
 
-# Fold the python-emitted ::LEVEL:: markers into the counters above by re-scanning our own
-# output would be complex in one pass; instead the python lines print with visible level tags.
-# (The Keycloak OK/FAIL already counted; python sub-checks are advisory and shown inline.)
-
 # ---------------------------------------------------------------------------
 hdr "SUMMARY"
 # ---------------------------------------------------------------------------
-echo "  OK=$nOK  WARN=$nWARN  FAIL=$nFAIL"
-echo "  (Section 4 python sub-checks print ::OK/WARN/FAIL:: inline — read them too.)"
-echo "  Deep config/price/locale audit: run check_machine.sh as well."
-if [ "$nFAIL" -gt 0 ]; then
-  echo "############ VERDICT: DO NOT SHIP — resolve FAILs first ############"; exit 2
-elif [ "$nWARN" -gt 0 ]; then
-  echo "############ VERDICT: review WARNs before shipping ############"; exit 1
-else
-  echo "############ VERDICT: identity + telemetry clean ############"; exit 0
+say "  mode=$MODE  OK=$nOK  WARN=$nWARN  FAIL=$nFAIL"
+if [ "$nFAIL" -gt 0 ]; then VERDICT="DO_NOT_SHIP"; RC=2
+elif [ "$nWARN" -gt 0 ]; then VERDICT="REVIEW"; RC=1
+else VERDICT="SHIP"; RC=0; fi
+say "############ VERDICT: $VERDICT ############"
+[ "$MODE" = "unit" ] && say "  Deep config/price/locale audit: run check_machine.sh as well."
+
+if [ "$JSON" = "1" ]; then
+  REC="$REC" MODE="$MODE" VERDICT="$VERDICT" HOSTNAME_="$(hostname)" \
+  nOK=$nOK nWARN=$nWARN nFAIL=$nFAIL python3 - <<'PY'
+import json, os, datetime
+checks = []
+for line in open(os.environ["REC"]):
+    parts = line.rstrip("\n").split("\t", 2)
+    if len(parts) == 3:
+        checks.append({"level": parts[0], "id": parts[1], "msg": parts[2]})
+print(json.dumps({
+    "schema": 1,
+    "mode": os.environ["MODE"],
+    "host": os.environ["HOSTNAME_"],
+    "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "verdict": os.environ["VERDICT"],
+    "counts": {"ok": int(os.environ["nOK"]), "warn": int(os.environ["nWARN"]), "fail": int(os.environ["nFAIL"])},
+    "checks": checks,
+}, ensure_ascii=False))
+PY
 fi
+exit $RC

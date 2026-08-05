@@ -32,6 +32,9 @@ MACHINE_NICKNAME="${MACHINE_NICKNAME:-}"
 UNITY_VERSION="${UNITY_VERSION:-}"
 SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+# Bring the kiosk back up at the very end, the way run.sh does. Set to anything but "true" to
+# leave the machine at the desktop instead (useful when more work follows the bootstrap run).
+START_APP_AFTER_BOOTSTRAP="${START_APP_AFTER_BOOTSTRAP:-true}"
 MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
 # FleetCatalog (Config/fleet.json): the machine PULLS its catalog + planogram from Strapi.
 # Tailscale-direct on purpose — admin.ishaker.xyz sits behind Cloudflare, which 403s the
@@ -40,6 +43,14 @@ FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
 FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
 FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
 OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}"
+# Readiness gate. Every step below verifies only itself, so a machine can pass all of them
+# and still be unshippable — no working freeze watchdog, /catalog returning 0 cells, Keycloak
+# rejecting the serial that was just registered. diagnose.sh --mode unit is the one check that
+# asks "is this shippable" as a whole, and bootstrap must not claim success without it.
+DIAGNOSE_URL="${DIAGNOSE_URL:-https://raw.githubusercontent.com/shakeradmin/scripts/main/diagnose.sh}"
+SKIP_READINESS_GATE="${SKIP_READINESS_GATE:-0}"
+READINESS_VERDICT="NOT_RUN"
+READINESS_REPORT=""
 MANAGE_KEYCLOAK_TOKEN_URL="${MANAGE_KEYCLOAK_TOKEN_URL:-https://kk.ishakerusa.com/realms/shaker-realm/protocol/openid-connect/token}"
 # Realm the MACHINE authenticates against (client_credentials, client_id == its serial). Used to
 # VERIFY that telemetry registration produced credentials ShakerView can actually authenticate with.
@@ -163,6 +174,7 @@ load_env() {
   UNITY_VERSION="${UNITY_VERSION:-}"
   SSD_VERSION="${SSD_VERSION:-}"
   BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+  START_APP_AFTER_BOOTSTRAP="${START_APP_AFTER_BOOTSTRAP:-true}"
   MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
   # MUST be re-defaulted here, not only at the top of the script: the top-level assignment
   # runs before .env is sourced, so CATALOG_TOKEN placed in .env would never reach it.
@@ -412,6 +424,46 @@ install_base_packages() {
 
   log "Installing base packages"
   apt_install curl ca-certificates gnupg openssl openssh-server python3
+}
+
+disable_auto_updates() {
+  log_section "Automatic Updates"
+  # A kiosk must only ever be updated deliberately, by fleetpatch/fleetfirmware. There are four
+  # independent channels and closing fewer than all four is a false sense of safety: machine 64
+  # lost 1.5 days on 2026-08-01 to a kernel panic that traced back to an unsupervised apt run.
+  # See Strapi knowledge rule-fleet-auto-updates-disabled-apt-and-snap.
+
+  log "Disabling APT periodic jobs"
+  cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+
+  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  systemctl mask apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 \
+    || record_warning "could not mask apt-daily timers"
+  systemctl mask unattended-upgrades.service >/dev/null 2>&1 || true
+
+  # snapd refreshes itself ~4x/day regardless of every apt setting above, and restarts services
+  # under a running kiosk while it does. Needs snapd >= 2.58 for an indefinite hold.
+  if command -v snap >/dev/null 2>&1; then
+    log "Holding snap auto-refresh"
+    snap refresh --hold >/dev/null 2>&1 \
+      || record_warning "snap refresh --hold failed — snaps will keep auto-refreshing"
+  fi
+
+  # Verify rather than assume. `snap get system refresh.hold` stays "none" after --hold and will
+  # happily lie to you; `snap refresh --time` is the only authoritative check.
+  log "apt-daily.timer: $(systemctl is-enabled apt-daily.timer 2>&1)"
+  log "apt-daily-upgrade.timer: $(systemctl is-enabled apt-daily-upgrade.timer 2>&1)"
+  if command -v snap >/dev/null 2>&1; then
+    local snap_hold
+    snap_hold="$(snap refresh --time 2>/dev/null | awk '/^hold:/ {print $2}')"
+    log "snap hold: ${snap_hold:-not held}"
+    [ "$snap_hold" = "forever" ] || record_warning "snap auto-refresh is not held indefinitely"
+  fi
 }
 
 configure_ssh() {
@@ -1586,6 +1638,128 @@ PY
   fi
 }
 
+# Blocking acceptance test. READ-ONLY: it changes nothing, it only decides whether this
+# machine may be called finished. Sets READINESS_VERDICT to SHIP / REVIEW / DO_NOT_SHIP /
+# UNVERIFIED, and records a warning (which makes bootstrap exit non-zero) for anything but SHIP.
+run_readiness_gate() {
+  log_section "Readiness gate (diagnose.sh --mode unit)"
+  if [ "$SKIP_READINESS_GATE" = "1" ]; then
+    READINESS_VERDICT="SKIPPED"
+    record_warning "readiness gate SKIPPED by SKIP_READINESS_GATE=1 — this machine ships unverified"
+    return 0
+  fi
+
+  local script="" tmp=""
+  local sibling="$(dirname "${BASH_SOURCE[0]}")/diagnose.sh"
+  if [ -f "$sibling" ]; then
+    script="$sibling"
+    log "using local diagnose.sh: $sibling"
+  else
+    tmp="$(mktemp)"
+    if curl -fsSL --max-time 30 "$DIAGNOSE_URL" -o "$tmp" && [ -s "$tmp" ]; then
+      script="$tmp"
+      log "fetched diagnose.sh from $DIAGNOSE_URL"
+    else
+      rm -f "$tmp"
+      READINESS_VERDICT="UNVERIFIED"
+      record_warning "could not fetch diagnose.sh from $DIAGNOSE_URL — readiness gate did not run, machine is UNVERIFIED"
+      return 0
+    fi
+  fi
+
+  local home_dir jf
+  home_dir="$(getent passwd "$SSH_LOGIN_USER" | cut -d: -f6)"
+  [ -d "$home_dir" ] || home_dir="/tmp"
+  jf="$home_dir/readiness-$(date +%Y%m%d-%H%M%S).json"
+  READINESS_REPORT="$jf"
+
+  # stdout is the JSON report; the human-readable lines come out on stderr and land in the
+  # bootstrap log through the tee at the top of this script.
+  bash "$script" local --mode=unit --json >"$jf"
+  local rc=$?
+  [ -n "$tmp" ] && rm -f "$tmp"
+  chown "$SSH_LOGIN_USER":"$SSH_LOGIN_USER" "$jf" 2>/dev/null || true
+
+  READINESS_VERDICT="$(python3 -c "import json;print(json.load(open('$jf'))['verdict'])" 2>/dev/null)"
+  [ -n "$READINESS_VERDICT" ] || READINESS_VERDICT="UNVERIFIED"
+  log "readiness gate exit=$rc verdict=$READINESS_VERDICT report=$jf"
+
+  local failed
+  failed="$(python3 -c "
+import json
+d=json.load(open('$jf'))
+print(', '.join(c['id'] for c in d['checks'] if c['level']=='FAIL'))" 2>/dev/null)"
+
+  case "$READINESS_VERDICT" in
+    SHIP)
+      log "Readiness gate PASSED — machine is shippable" ;;
+    REVIEW)
+      record_warning "readiness gate: REVIEW (warnings only, no hard failures) — read $jf before shipping" ;;
+    DO_NOT_SHIP)
+      record_warning "READINESS GATE FAILED — machine is NOT shippable. Failing checks: ${failed:-see report}. Full report: $jf" ;;
+    *)
+      record_warning "readiness gate produced no usable verdict — machine is UNVERIFIED (report: $jf)" ;;
+  esac
+}
+
+# Bring the kiosk back up once provisioning is done, the same way run.sh does.
+#
+# run.sh is just `DISPLAY=:0 exec /home/shaker/AppManager`, but bootstrap runs as root, so
+# copying that line verbatim would start the watchdog in root's session with no X credentials
+# and nothing would appear on the screen. The launch has to be handed back to the desktop user
+# with a full X/D-Bus environment.
+#
+# Deliberately NOT nohup or a systemd unit: AppManager is terminal-attached by design so a
+# technician on site can stop the kiosk by closing the window. Nothing is ever killed here
+# either — if the watchdog is already up, a second copy would only fight it for the app.
+start_kiosk_app() {
+  log_section "Start kiosk app (AppManager)"
+
+  if [ "$START_APP_AFTER_BOOTSTRAP" != "true" ]; then
+    log "START_APP_AFTER_BOOTSTRAP=$START_APP_AFTER_BOOTSTRAP — leaving the kiosk stopped"
+    return 0
+  fi
+
+  local user home uid appmanager xauth running
+  user="${SUDO_USER:-$(id -un)}"
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  uid="$(id -u "$user" 2>/dev/null || true)"
+  appmanager="$home/AppManager"
+
+  if [ -z "$uid" ] || [ ! -x "$appmanager" ]; then
+    record_warning "AppManager missing or not executable at $appmanager — kiosk NOT started"
+    return 0
+  fi
+
+  # comm-based, never `pgrep -f`: AppManager's own command line embeds the ShakerView binary
+  # path, so a full-cmdline match counts the watchdog as though it were the app itself.
+  running="$(ps -eo comm | grep -c '^AppManager$' || true)"
+  if [ "$running" -gt 0 ]; then
+    log "AppManager already running ($running instance(s)) — its own loop will pick up ShakerView"
+    return 0
+  fi
+
+  xauth="/run/user/$uid/gdm/Xauthority"
+  [ -f "$xauth" ] || xauth="$home/.Xauthority"
+
+  log "Launching $appmanager as $user (DISPLAY=:0, XAUTHORITY=$xauth)"
+  if sudo -u "$user" env \
+      DISPLAY=:0 \
+      XAUTHORITY="$xauth" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      gnome-terminal --working-directory="$home" -- "$appmanager" >/dev/null 2>&1; then
+    sleep 5
+    running="$(ps -eo comm | grep -c '^AppManager$' || true)"
+    if [ "$running" -gt 0 ]; then
+      log "AppManager is up"
+    else
+      record_warning "AppManager was launched but is not running 5s later — check the kiosk screen"
+    fi
+  else
+    record_warning "could not launch AppManager — start the kiosk manually with run.sh"
+  fi
+}
+
 main() {
   protect_env_file
   load_env
@@ -1627,6 +1801,7 @@ main() {
   load_creds_from_strapi || record_warning "could not load creds from Strapi cred entity — falling back to any locally-provided TAILSCALE_AUTHKEY/ANYDESK_PASSWORD"
 
   install_base_packages
+  disable_auto_updates
   configure_ssh
   install_ops_ssh_key
   reinstall_anydesk
@@ -1684,12 +1859,18 @@ main() {
     chown "$SUDO_USER:$SUDO_USER" "$LOGFILE" || true
   fi
 
+  # Last, and blocking: provisioning is not "done" until something has verified the result
+  # as a whole. Runs after every write above so it sees the machine exactly as it will ship.
+  run_readiness_gate
+
   echo
   echo "=============================================================="
-  if [ "${#SETUP_WARNINGS[@]}" -eq 0 ]; then
-    echo "BOOTSTRAP SUCCEEDED"
+  if [ "$READINESS_VERDICT" = "SHIP" ] && [ "${#SETUP_WARNINGS[@]}" -eq 0 ]; then
+    echo "BOOTSTRAP SUCCEEDED — READY TO SHIP"
+  elif [ "$READINESS_VERDICT" = "DO_NOT_SHIP" ]; then
+    echo "BOOTSTRAP FINISHED — MACHINE IS NOT SHIPPABLE (readiness gate failed)"
   else
-    echo "BOOTSTRAP COMPLETED WITH ERRORS (${#SETUP_WARNINGS[@]})"
+    echo "BOOTSTRAP COMPLETED WITH ERRORS (${#SETUP_WARNINGS[@]}) — readiness: $READINESS_VERDICT"
   fi
   echo "=============================================================="
   echo "Strapi machine id : $machine_id"
@@ -1712,10 +1893,15 @@ main() {
     echo "Telemetry status  : not registered — fetch REG code manually from manage.ishakerusa.com"
   fi
   echo "Log file          : $LOGFILE"
+  echo "Readiness verdict : $READINESS_VERDICT${READINESS_REPORT:+  (report: $READINESS_REPORT)}"
   if [ -n "$reg_code" ] && [ -z "$machine_key" ]; then
     echo
     echo "Remaining manual step: enter '$reg_code' on-device via Service Menu > Telemetry > Activation key, then restart ShakerView."
   fi
+
+  # Deliberately after the summary, so the operator gets to read it before ShakerView takes the
+  # screen — but before the exit below, which would otherwise skip the kiosk on any warning.
+  start_kiosk_app
 
   if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
     echo
