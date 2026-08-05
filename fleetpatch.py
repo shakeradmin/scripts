@@ -178,9 +178,17 @@ def managed_fingerprint_remote(target):
 # ---------------------------------------------------------------- gate
 
 def stable_patches(token):
+    """Stable patches, newest first — sorted HERE, not by the server.
+
+    `&sort=id:desc` in the query string is silently ignored by this Strapi (verified
+    2026-08-05: it returns 12, 17, 19 — ascending). Everything downstream documented itself
+    as "already sorted id:desc" and relied on it, so selection always landed on the OLDEST
+    stable patch for a type. That is why patch 17 never rolled out on its own and had to be
+    installed with an explicit --patch: patch 12 came first in the list and won every time.
+    """
     q = ("/api/patches?filters[isStable][$eq]=true&populate[machine_types][fields][0]=id"
-         "&pagination[pageSize]=100&sort=id:desc")
-    return api(q, token)["data"]
+         "&pagination[pageSize]=100")
+    return sorted(api(q, token)["data"], key=lambda p: p["id"], reverse=True)
 
 
 def candidate_machines(token):
@@ -203,13 +211,37 @@ def candidate_machines(token):
     return out
 
 
-def pick_patch(patches, machine):
-    """Highest stable patch whose machine_types include this machine's type."""
-    for p in patches:  # already sorted id:desc
-        types = [t["id"] for t in (p["attributes"].get("machine_types") or {}).get("data", [])]
-        if machine["type_id"] in types:
+def pick_patch(patches, machine, live_md5=None):
+    """Highest stable patch this machine can actually take.
+
+    `machine_type` alone stopped being enough the moment two lineages shipped stable patches
+    for the same type: on 2026-08-05 patch 19 (boba lineage, sole base bed4cc65) went stable
+    for `shaker s`, and because selection was "highest id whose type matches, full stop", it
+    was proposed to EVERY Shaker S. None of them hold bed4cc65, so they were all reported as
+    "not an accepted base" and the whole type stopped patching -- while patch 17, which does
+    list their builds, sat right there unconsidered.
+
+    So the base list participates in the choice, not only in the verdict afterwards. Machines
+    whose live build is unknown (unreachable) keep the old type-only behaviour, and the
+    Managed/ fingerprint check downstream still has the final say on compatibility.
+    """
+    candidates = [p for p in patches  # already sorted id:desc
+                  if machine["type_id"] in
+                  [t["id"] for t in (p["attributes"].get("machine_types") or {}).get("data", [])]]
+    if not candidates:
+        return None
+    if not live_md5:
+        return candidates[0]
+    for p in candidates:
+        a = p["attributes"]
+        # Already on it: that IS the right patch, nothing to do downstream.
+        if live_md5 == first_md5(a.get("patched_md5")):
             return p
-    return None
+        if live_md5 in all_md5(a.get("base_md5")):
+            return p
+    # Nothing accepts this build. Return the newest for its type so the log still names a
+    # patch and prints its base list -- that message is how a missing base gets noticed.
+    return candidates[0]
 
 
 # ---------------------------------------------------------------- install
@@ -423,7 +455,17 @@ def main():
 
     installed = 0
     for m in machines:
-        p = pick_patch(patches, m)
+        # Read the live build BEFORE choosing, so the choice can account for it. One extra
+        # cheap ssh; install() reads it again for its own verdict rather than trusting a
+        # value that could have changed in between.
+        live_md5 = None
+        if m.get("ip"):
+            rc, out = ssh(f"{m['user']}@{m['ip']}",
+                          f"md5sum {SV_DIR}/Managed/CommonCode.dll | cut -d' ' -f1")
+            if rc == 0:
+                live_md5 = out.strip() or None
+
+        p = pick_patch(patches, m, live_md5)
         if not p:
             log(f"machine {m['id']}: no stable patch for its machine_type")
             continue
