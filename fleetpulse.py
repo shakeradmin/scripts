@@ -23,9 +23,13 @@ Per machine, per cycle:
      two writers on config.json. Left in the status line as a marker only.
   4. restart  — if media changed: canonical single-PID kill (AppManager relaunches in
      ~15 s). NEVER pattern-kills.
+  5. autoupd  — Ubuntu's own update channels must stay shut (apt-daily timers, snap
+     auto-refresh). Reported every cycle, and re-shut if a machine comes back with them
+     open. Idempotent, touches no binary and restarts nothing.
 
 NOT here either: patch rollout. That is fleetpatch.py — a health sweep that also swaps
-binaries is a sweep you stop trusting.
+binaries is a sweep you stop trusting. Shutting an OS update channel is deliberately on
+the other side of that line: it only ever *prevents* changes to the machine.
 
 State: ~/fleetpulse/state/<machine-id>/ (media manifest, staging).
 Log:   one summary line per swept machine on stdout; cron wrapper filters idle lines.
@@ -49,6 +53,15 @@ UA = "fleetpulse/1.0"
 # non-browser user agents. Check against the same URL the machine itself uses.
 FLEET_URL = os.environ.get("FLEET_CATALOG_URL", "http://100.101.29.104:1338")
 MEDIA = "~/ShakerView2.0Linux/ShakerView2.0_Data/Media"
+SUDO_PASS = ""            # filled from the creds .env in main(); never hardcode it here
+# Readiness gate (diagnose.sh --mode unit --json). Answers "is this machine shippable" as a
+# whole, which no single sweep check does. Deliberately throttled: a full run costs ~18s of SSH
+# per machine, so running it every 3-minute sweep would spend the whole sweep on it. Once an
+# hour is far more often than the things it watches (a gutted watchdog, a lost c-state clamp, a
+# patch that silently reverted) actually drift.
+READINESS_INTERVAL = int(os.environ.get("READINESS_INTERVAL", "3600"))
+READINESS_TIMEOUT = 90
+_readiness_field_missing = False   # set once if Strapi rejects the field, to stop log spam
 
 # Reuse load_product_media's Strapi helpers + media collection (same key derivation
 # as the catalog controller). Import by path: the script has a __main__ guard.
@@ -87,10 +100,10 @@ def select_machines(token):
     return out
 
 
-def ssh_run(target, cmd, timeout=SSH_TIMEOUT):
+def ssh_run(target, cmd, timeout=SSH_TIMEOUT, stdin=None):
     r = subprocess.run(["ssh", "-o", "ConnectTimeout=8",
                         "-o", "StrictHostKeyChecking=accept-new", target, cmd],
-                       capture_output=True, text=True, timeout=timeout + 20)
+                       input=stdin, capture_output=True, text=True, timeout=timeout + 20)
     return r.returncode, r.stdout
 
 
@@ -102,6 +115,19 @@ echo "DIAG=$(tail -1 ~/ShakerView-diag/patch-diag.log 2>/dev/null | cut -c1-60)"
 echo "CATMD5=$(grep -a -o 'catalog loaded from Strapi for [^ ]* (md5 [0-9a-f]*' ~/ShakerView-diag/patch-diag.log 2>/dev/null | tail -1 | grep -o '[0-9a-f]*$')"
 echo "WS=$(tail -c 40000 ~/.config/unity3d/*/*/Player.log 2>/dev/null | grep -a 'isConnected' | tail -1 | grep -o 'True\|False')"
 echo "DISK=$(df -h /home | awk 'NR==2{print $4}')"
+echo "APTTIMER=$(systemctl is-enabled apt-daily.timer 2>&1)"
+echo "SNAPHOLD=$(command -v snap >/dev/null 2>&1 && { snap refresh --time 2>/dev/null | awk '/^hold:/{print $2}' | grep . || echo none; } || echo nosnapd)"
+"""
+
+# Closing Ubuntu's update channels. `snap get system refresh.hold` stays "none" after a
+# --hold and will lie to an auditor, so the check above reads `snap refresh --time`, which
+# is authoritative. All four operations are idempotent — re-running costs nothing.
+ENFORCE_AUTOUPD_CMD = r"""sudo -S -p '' bash -c '
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+systemctl mask apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+systemctl mask unattended-upgrades.service >/dev/null 2>&1
+command -v snap >/dev/null 2>&1 && snap refresh --hold >/dev/null 2>&1
+exit 0'
 """
 
 
@@ -118,7 +144,40 @@ def heartbeat(target):
             "telemetry_ws": {"True": True, "False": False}.get(kv.get("WS", "").strip()),
             "catalog_md5": kv.get("CATMD5", "").strip() or None,
             "diag_last": kv.get("DIAG", "").strip() or None,
-            "disk_free": kv.get("DISK", "").strip() or None}
+            "disk_free": kv.get("DISK", "").strip() or None,
+            "auto_updates": {"apt_timer": kv.get("APTTIMER", "").strip() or None,
+                             "snap_hold": kv.get("SNAPHOLD", "").strip() or None}}
+
+
+def auto_updates_open(status):
+    """Which Ubuntu update channels are still live on this machine? (list of names)"""
+    au = status.get("auto_updates") or {}
+    open_ch = []
+    if au.get("apt_timer") not in ("masked", "disabled", None):
+        open_ch.append("apt-daily.timer")
+    # An UNHELD snap drops the "hold:" line from `snap refresh --time` entirely, so an empty
+    # answer must never be read as "fine" — the probe emits the literal "nosnapd" when there
+    # is genuinely no snapd, and "none" when snapd is there and unheld. Anything that is not
+    # "forever" or "nosnapd" is an open channel.
+    if au.get("snap_hold") not in ("forever", "nosnapd", None):
+        open_ch.append("snap-refresh")
+    return open_ch
+
+
+def enforce_auto_updates_off(target):
+    """Re-shut the OS update channels. Returns (ok, detail).
+
+    Runs when a machine turns up with them open — typically one that was offline when the
+    fleet-wide pass ran, or freshly imaged from a golden that predates bootstrap.sh doing it.
+    """
+    if not SUDO_PASS:
+        return False, "no SUDO_PASS in env"
+    rc, _ = ssh_run(target, ENFORCE_AUTOUPD_CMD, stdin=SUDO_PASS + "\n")
+    if rc != 0:
+        return False, f"enforce command failed (rc={rc})"
+    rc, out = ssh_run(target, "systemctl is-enabled apt-daily.timer 2>&1; "
+                              "snap refresh --time 2>/dev/null | awk '/^hold:/{print $2}'")
+    return ("masked" in out and "forever" in out), out.replace("\n", "/").strip("/")
 
 
 def media_manifest(token, machine_id):
@@ -242,6 +301,66 @@ def firmware_write_active(target):
     return False, ""
 
 
+def readiness_check(target, mdir, force=False):
+    """Run diagnose.sh --mode unit --json against the machine; throttled to READINESS_INTERVAL.
+
+    Returns (report_dict, ran_now). report_dict is the stored one when throttled, or None if the
+    gate has never run and it is not due yet. Never raises: a gate that cannot run must not
+    abort a sweep that is otherwise fine.
+    """
+    cache = os.path.join(mdir, "readiness.json")
+    prev = None
+    if os.path.exists(cache):
+        try:
+            prev = json.load(open(cache))
+        except Exception:
+            prev = None
+    if not force and prev:
+        try:
+            last = datetime.datetime.strptime(prev["at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc)
+            if (datetime.datetime.now(datetime.timezone.utc) - last).total_seconds() < READINESS_INTERVAL:
+                return prev, False
+        except Exception:
+            pass
+
+    host = target.split("@", 1)[-1]
+    try:
+        r = subprocess.run(["bash", os.path.join(SCRIPTS, "diagnose.sh"), host,
+                            "--mode=unit", "--json"],
+                           capture_output=True, text=True, timeout=READINESS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return prev, False
+    # Exit code is the verdict (0 ship / 1 review / 2 do-not-ship), so a non-zero exit is a
+    # RESULT, not an error. Only unparseable stdout means the gate failed to run.
+    try:
+        report = json.loads(r.stdout)
+    except Exception:
+        return prev, False
+    try:
+        json.dump(report, open(cache, "w"))
+    except Exception:
+        pass
+    return report, True
+
+
+def readiness_summary(report):
+    """The shape stored on the machine record: verdict plus what is actually wrong."""
+    if not report:
+        return None
+    return {
+        "at": report.get("at"),
+        "verdict": report.get("verdict"),
+        "counts": report.get("counts"),
+        "failed": [c["id"] for c in report.get("checks", []) if c.get("level") == "FAIL"],
+        "warned": [c["id"] for c in report.get("checks", []) if c.get("level") == "WARN"],
+        # Keep the messages for the failures only — enough to act on without storing the
+        # whole 37-check report on every machine row.
+        "detail": {c["id"]: c["msg"] for c in report.get("checks", [])
+                   if c.get("level") == "FAIL"},
+    }
+
+
 def sweep_machine(m, token, dry_run=False, verbose=False):
     mdir = os.path.join(STATE_ROOT, str(m["id"]))
     os.makedirs(mdir, exist_ok=True)
@@ -262,6 +381,17 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
         return status, ["unreachable"]
     if status.get("app_pid") is None:
         notes.append("WARN: app not running")
+
+    # 1b) Ubuntu update channels must stay shut. A machine that was offline during the
+    # fleet-wide pass (2026-08-01) reappears with them open; close them on first sight.
+    open_ch = auto_updates_open(status)
+    if open_ch and not dry_run:
+        ok, detail = enforce_auto_updates_off(target)
+        status["auto_updates"]["enforced"] = ok
+        notes.append(f"auto-updates were OPEN ({', '.join(open_ch)}) — "
+                     + (f"closed: {detail}" if ok else f"FAILED to close: {detail}"))
+    elif open_ch:
+        notes.append(f"auto-updates OPEN ({', '.join(open_ch)}) — dry-run, not touched")
 
     restart_needed = False
 
@@ -328,6 +458,21 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
             rc, out = ssh_run(target, rcmd)
             notes.append("app restarted (media)" if "restarted" in out else "WARN: restart kill failed")
 
+    # 5) readiness gate — the whole-machine verdict, throttled to once an hour.
+    try:
+        report, ran = readiness_check(target, mdir)
+        summary = readiness_summary(report)
+        if summary:
+            status["readiness"] = summary
+            if ran:
+                notes.append(f"readiness: {summary['verdict']}"
+                             + (f" — FAIL: {', '.join(summary['failed'])}" if summary["failed"] else ""))
+            if summary["verdict"] == "DO_NOT_SHIP" and summary["failed"]:
+                notes.append("NOT SHIPPABLE: " + "; ".join(
+                    f"{k}: {v}" for k, v in summary["detail"].items()))
+    except Exception as e:
+        notes.append(f"readiness gate error: {str(e)[:120]}")
+
     if verbose:
         print(json.dumps(status, indent=1))
     return status, notes
@@ -343,6 +488,12 @@ def main():
     env = lpm.load_env()
     ident = env.get("STRAPI_MACHINE_USER_USERNAME") or env.get("STRAPI_MACHINE_USER_LOGIN")
     token = lpm.strapi_login(ident, env["STRAPI_MACHINE_USER_PASSWORD"])
+
+    global SUDO_PASS
+    SUDO_PASS = env.get("SUDO_PASS") or ""
+    if not SUDO_PASS:
+        print("WARN: no SUDO_PASS in the creds .env — auto-update channels will be "
+              "reported but not re-closed")
 
     ctoken = catalog_token(token)
     if not ctoken:
@@ -363,6 +514,20 @@ def main():
                 api_put(f"/api/machines/{m['id']}", token, {"fleet_status": status})
             except Exception as e:
                 notes.append(f"WARN: fleet_status write failed: {e}")
+            # Separate write: `readiness` is a new field, and until it is deployed Strapi
+            # rejects the whole payload containing it. Sending it on its own keeps
+            # fleet_status landing on every sweep regardless, and one refusal disables the
+            # attempt for the rest of the run instead of logging the same failure per machine.
+            global _readiness_field_missing
+            summary = status.get("readiness")
+            if summary and not _readiness_field_missing:
+                try:
+                    api_put(f"/api/machines/{m['id']}", token, {"readiness": summary})
+                except Exception as e:
+                    _readiness_field_missing = True
+                    notes.append(f"WARN: readiness field not writable yet ({str(e)[:90]}) — "
+                                 "skipping it for the rest of this run; the verdict is still "
+                                 "in the log and in fleetpulse state")
         idle = (status.get("sweep") == "ok" and not notes
                 and not (status.get("media") or {}).get("changed")
                 and not (status.get("media_keys") or {}).get("missing"))
