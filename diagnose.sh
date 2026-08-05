@@ -346,7 +346,24 @@ if [ -f "$DIAGLOG" ]; then
     # against. Treating that as "wedged" fails every machine whose app has just started —
     # including every freshly provisioned one, where bootstrap runs this gate seconds later.
     UPMIN="$(printf '%s' "$LAST" | grep -oE '\[up=[0-9]+m\]' | grep -oE '[0-9]+')"
-    if printf '%s' "$LAST" | grep -q 'mainthread=STALLED'; then
+    # A controller-firmware write looks EXACTLY like a freeze to PatchDiag, and legitimately so:
+    # StartUpdatingFirmware() loads ControllerUpdatePage and unloads the active scene, destroying
+    # the MonoBehaviour that stamps FrameTick. Observed live on machine 104 — 526s of
+    # mainthread=STALLED for a perfectly healthy 8-minute flash. Same hold-off the watchdog's
+    # firmware_write_active() applies, but stateless: this runs once, so it dates the last
+    # firmware line instead of watching the counter climb.
+    FWACTIVE=0
+    if compgen -G "$DATA"/*.hex >/dev/null 2>&1; then
+      FWLINE="$(grep -ahE '\[Log\] [0-9]+ CommandManager\.IsControllerReadyToReadNextLineOfFirmware' "$DATA"/Logs/*.log 2>/dev/null | tail -1)"
+      if [ -n "$FWLINE" ]; then
+        FWTS="$(printf '%s' "$FWLINE" | sed -E 's/^\[([0-9-]+ [0-9:]+).*/\1/')"
+        FWAGE=$(( $(date +%s) - $(date -d "$FWTS" +%s 2>/dev/null || echo 0) ))
+        [ "$FWAGE" -ge 0 ] && [ "$FWAGE" -lt "${FW_HOLD_GRACE:-300}" ] && FWACTIVE=1
+      fi
+    fi
+    if printf '%s' "$LAST" | grep -q 'mainthread=STALLED' && [ "$FWACTIVE" = "1" ]; then
+      info heartbeat.state "frames stalled, but a controller-firmware write is in progress (last line ${FWAGE}s ago) — expected, the flash unloads the scene that counts frames. Re-check after it finishes."
+    elif printf '%s' "$LAST" | grep -q 'mainthread=STALLED'; then
       fail heartbeat.state "kiosk is FROZEN RIGHT NOW: $(printf '%s' "$LAST" | grep -oE 'frames=.*')"
     elif [ "${AGE:-999}" -gt 5 ]; then
       warn heartbeat.state "last PatchDiag heartbeat is ${AGE}min old — app restarted, or diagnostics stopped"
