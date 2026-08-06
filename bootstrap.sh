@@ -505,12 +505,31 @@ PY
   done
 }
 
+# THE serial format, and the only one accepted: digits, optionally followed by "-" and a
+# tail. The tail exists because register_telemetry_with_retry() appends "-r<hex>" when a
+# serial has to be burned and retried (260511737-r1722, 004-r5b6c) -- so whatever this
+# function accepts has to survive its own output.
+#
+# Model-prefixed forms like S-25011715S / T2-25110041S are NOT valid here: the same physical
+# machine then appears under two different identities (bare digits in Strapi, prefixed in the
+# cabinet), and the serial is also the Keycloak client_id, so the mismatch is not cosmetic.
+serial_is_valid() {
+  [[ "$1" =~ ^[0-9]+(-[A-Za-z0-9]+)?$ ]]
+}
+
+# Best-effort normalisation of a legacy on-device value, offered as a SUGGESTION only --
+# never applied silently. "T2-25110041S" -> "25110041", "S-25011715S" -> "25011715".
+serial_suggestion() {
+  local s="$1"
+  s="${s#*-}"                       # drop a leading model prefix up to the first "-"
+  s="$(printf '%s' "$s" | sed 's/[A-Za-z]*$//')"   # drop a trailing letter suffix
+  serial_is_valid "$s" && printf '%s' "$s"
+}
+
 serial_looks_wrong() {
   local s="$1"
-  # Fleet serials are year-prefixed: 24/25/26 (25010056, 260511734) or carry a model prefix
-  # (S-25011715S, T2-25110041S). AnyDesk IDs are 9-10 bare digits and never start with 2
-  # (1855932134, 1322509133, 467331074). Flag that shape only -- a bare 9-digit 2605xxxxx
-  # serial is legitimate and must not be second-guessed.
+  # Format-valid but almost certainly an AnyDesk ID: those are 9-10 bare digits and never
+  # start with 2, while fleet serials are year-prefixed 24/25/26 (25010056, 260511734).
   [[ "$s" =~ ^[0-9]{9,10}$ ]] && [[ "$s" != 2* ]]
 }
 
@@ -525,9 +544,19 @@ say_tty() {
 }
 
 prompt_for_serial_number() {
-  local serial="" onbox="" default="" answer=""
+  local serial="" onbox="" default="" answer="" suggested=""
   onbox="$(onbox_serial)"
-  default="${MACHINE_SERIAL_NUMBER:-$onbox}"
+
+  # The default offered at the prompt must itself be a legal serial. A legacy prefixed value
+  # on the machine (T2-25110041S) is shown, but only its normalised form can be the default.
+  if [ -n "$MACHINE_SERIAL_NUMBER" ] && serial_is_valid "$MACHINE_SERIAL_NUMBER"; then
+    default="$MACHINE_SERIAL_NUMBER"
+  elif [ -n "$onbox" ] && serial_is_valid "$onbox"; then
+    default="$onbox"
+  else
+    suggested="$(serial_suggestion "${MACHINE_SERIAL_NUMBER:-$onbox}")"
+    default="$suggested"
+  fi
 
   # Always SHOW both serials and always let the operator confirm, even when .env supplies one.
   # Silently trusting MACHINE_SERIAL_NUMBER meant the run never displayed the value that was
@@ -537,28 +566,41 @@ prompt_for_serial_number() {
   say_tty "  ------------------------------------------------------------"
   say_tty "  serial in configuration : ${MACHINE_SERIAL_NUMBER:-<not set>}"
   say_tty "  serial on this machine  : ${onbox:-<none found>}"
+  if [ -n "$MACHINE_SERIAL_NUMBER" ] && ! serial_is_valid "$MACHINE_SERIAL_NUMBER"; then
+    say_tty "  !! the configured serial is not a legal serial and will NOT be used as-is"
+    record_warning "MACHINE_SERIAL_NUMBER=$MACHINE_SERIAL_NUMBER is not digits or digits-tail — operator had to enter a valid serial"
+  fi
+  if [ -n "$onbox" ] && ! serial_is_valid "$onbox"; then
+    say_tty "  !! the on-device serial carries a model prefix/suffix — it will be replaced"
+  fi
+  [ -n "$suggested" ] && say_tty "  suggested (normalised)  : $suggested"
   if [ -n "$MACHINE_SERIAL_NUMBER" ] && [ -n "$onbox" ] && [ "$MACHINE_SERIAL_NUMBER" != "$onbox" ]; then
     say_tty "  !! THEY DISAGREE — what you confirm below overwrites hard_settings.MachineSerial"
     record_warning "MACHINE_SERIAL_NUMBER=$MACHINE_SERIAL_NUMBER differs from on-device hard_settings.MachineSerial=$onbox — the on-device value gets overwritten"
   fi
+  say_tty "  format: digits only, or digits-tail (25110041, 260511737-r1722)"
   say_tty "  ------------------------------------------------------------"
-  log "serial from configuration: ${MACHINE_SERIAL_NUMBER:-<unset>}; on-device: ${onbox:-<none>}"
+  log "serial from configuration: ${MACHINE_SERIAL_NUMBER:-<unset>}; on-device: ${onbox:-<none>}; default offered: ${default:-<none>}"
 
   # No terminal to confirm on (cron, piped install): fall back to the configured value rather
-  # than blocking forever on a read that can never be answered.
-  if [ ! -r /dev/tty ] && [ ! -t 0 ] && [ -n "$MACHINE_SERIAL_NUMBER" ]; then
-    log "no TTY to confirm on — using MACHINE_SERIAL_NUMBER unattended"
-    printf "%s" "$MACHINE_SERIAL_NUMBER"
-    return
+  # than blocking forever on a read that can never be answered -- but only if it is legal.
+  if [ ! -r /dev/tty ] && [ ! -t 0 ]; then
+    if [ -n "$MACHINE_SERIAL_NUMBER" ] && serial_is_valid "$MACHINE_SERIAL_NUMBER"; then
+      log "no TTY to confirm on — using MACHINE_SERIAL_NUMBER unattended"
+      printf "%s" "$MACHINE_SERIAL_NUMBER"
+      return
+    fi
+    log "ERROR: no TTY and no valid MACHINE_SERIAL_NUMBER — refusing to invent a serial"
+    return 1
   fi
 
   local tries=0
   while [ -z "$serial" ]; do
     tries=$((tries + 1))
     # Bounded: if the terminal goes away mid-run, read returns empty forever and the old
-    # unbounded loop span at 100% CPU with nobody watching.
+    # unbounded loop spun at 100% CPU with nobody watching.
     if [ "$tries" -gt 10 ]; then
-      say_tty "  no serial entered after 10 attempts — aborting"
+      say_tty "  no valid serial entered after 10 attempts — aborting"
       log "ERROR: no serial number could be read from the terminal"
       return 1
     fi
@@ -569,10 +611,20 @@ prompt_for_serial_number() {
       serial="$(read_tty "  Serial to register: " | xargs)"
     fi
 
+    # Hard rule, no override: anything but digits (optionally digits-tail) is rejected.
+    if [ -n "$serial" ] && ! serial_is_valid "$serial"; then
+      say_tty ""
+      say_tty "  \"$serial\" is not a valid serial."
+      say_tty "  Allowed: digits only (25110041), or digits + \"-\" + tail (260511737-r1722)."
+      serial=""
+      continue
+    fi
+
+    # Format-legal but suspicious: soft guard, operator can override deliberately.
     if [ -n "$serial" ] && serial_looks_wrong "$serial"; then
       say_tty ""
-      say_tty "  \"$serial\" is ${#serial} bare digits — that is an AnyDesk ID, not a machine serial."
-      say_tty "  Machine serials look like S-25011715S / T2-25110041S / 25010056."
+      say_tty "  \"$serial\" is ${#serial} bare digits and does not start with 2 — that is the"
+      say_tty "  shape of an AnyDesk ID, not of a fleet serial (25010056, 260511734)."
       if [ "$(read_tty "  Use it anyway? (yes/NO): " | xargs)" != "yes" ]; then
         serial=""
       fi
