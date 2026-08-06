@@ -4,10 +4,29 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$SCRIPT_DIR/.env"
 LOG_OWNER_USER="${SUDO_USER:-$(id -un)}"
 LOG_OWNER_HOME="$(getent passwd "$LOG_OWNER_USER" | cut -d: -f6)"
 LOGFILE="${LOG_OWNER_HOME:-$HOME}/bootstrap_device_$(date +%Y%m%d_%H%M%S).log"
+
+# .env lookup. SCRIPT_DIR alone is wrong for the normal launch path: the ~/Desktop/scripts/*.sh
+# on machines are thin GitHub loaders that fetch this file into /tmp and `exec bash` it, so
+# SCRIPT_DIR is /tmp and a .env sitting next to the loader was silently ignored (every run
+# logged "WARNING: .env not found at /tmp/.env" and then registered with default settings --
+# e.g. MANAGE_ORG_ID=2 on machines that belong to another organization). Search the operator's
+# scripts folder too, and let BOOTSTRAP_ENV_FILE override everything.
+resolve_env_file() {
+  local candidate
+  for candidate in \
+    "${BOOTSTRAP_ENV_FILE:-}" \
+    "$SCRIPT_DIR/.env" \
+    "${LOG_OWNER_HOME:-$HOME}/Desktop/scripts/.env" \
+    "${LOG_OWNER_HOME:-$HOME}/.config/ishaker/bootstrap.env"
+  do
+    [ -n "$candidate" ] && [ -f "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+  done
+  printf '%s' "$SCRIPT_DIR/.env"
+}
+ENV_FILE="$(resolve_env_file)"
 
 WIFI_NETWORK="${WIFI_NETWORK:-}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-}"
@@ -322,17 +341,68 @@ wait_for_online() {
   log "Internet is online"
 }
 
+# The serial typed here becomes the Keycloak client_id, the hard_settings.MachineSerial and
+# the Strapi record -- get it wrong and the machine's telemetry identity is overwritten with
+# someone else's. On 2026-08-06 an operator typed an AnyDesk ID (1855932134) at this prompt on
+# a working machine, and bootstrap wrote it straight into hard_settings, breaking a serial
+# (25010056) that had been authenticating fine. So: show what the machine says about itself,
+# offer it as the default, and refuse the shapes that are obviously not serials.
+onbox_serial() {
+  local hs
+  for hs in /home/*/ShakerView2.0Linux*/ShakerView2.0_Data/Config/hard_settings.json; do
+    [ -e "$hs" ] || continue
+    HS="$hs" python3 - <<'PY' 2>/dev/null || true
+import json, os
+try:
+    with open(os.environ["HS"], encoding="utf-8-sig") as fh:
+        print((json.load(fh).get("MachineSerial") or "").strip())
+except Exception:
+    pass
+PY
+    return
+  done
+}
+
+serial_looks_wrong() {
+  local s="$1"
+  # Fleet serials are year-prefixed: 24/25/26 (25010056, 260511734) or carry a model prefix
+  # (S-25011715S, T2-25110041S). AnyDesk IDs are 9-10 bare digits and never start with 2
+  # (1855932134, 1322509133, 467331074). Flag that shape only -- a bare 9-digit 2605xxxxx
+  # serial is legitimate and must not be second-guessed.
+  [[ "$s" =~ ^[0-9]{9,10}$ ]] && [[ "$s" != 2* ]]
+}
+
 prompt_for_serial_number() {
-  local serial=""
+  local serial="" onbox=""
+  onbox="$(onbox_serial)"
 
   if [ -n "$MACHINE_SERIAL_NUMBER" ]; then
     log "Using MACHINE_SERIAL_NUMBER from environment"
+    if [ -n "$onbox" ] && [ "$onbox" != "$MACHINE_SERIAL_NUMBER" ]; then
+      record_warning "MACHINE_SERIAL_NUMBER=$MACHINE_SERIAL_NUMBER differs from on-device hard_settings.MachineSerial=$onbox — the on-device value will be overwritten"
+    fi
     printf "%s" "$MACHINE_SERIAL_NUMBER"
     return
   fi
 
+  [ -n "$onbox" ] && log "This machine currently reports MachineSerial: $onbox"
+
   while [ -z "$serial" ]; do
-    serial="$(read_tty "Enter machine serial_number: " | xargs)"
+    if [ -n "$onbox" ]; then
+      serial="$(read_tty "Enter machine serial_number [$onbox]: " | xargs)"
+      [ -z "$serial" ] && serial="$onbox"
+    else
+      serial="$(read_tty "Enter machine serial_number: " | xargs)"
+    fi
+
+    if [ -n "$serial" ] && serial_looks_wrong "$serial"; then
+      printf '\n  "%s" is %s bare digits — that is an AnyDesk ID, not a machine serial.\n' \
+        "$serial" "${#serial}" >&2
+      printf '  Machine serials look like S-25011715S / T2-25110041S / 25010056.\n' >&2
+      if [ "$(read_tty "  Use it anyway? (yes/NO): " | xargs)" != "yes" ]; then
+        serial=""
+      fi
+    fi
   done
 
   printf "%s" "$serial"
@@ -655,6 +725,32 @@ EOF
 reinstall_anydesk() {
   log_section "AnyDesk Setup"
 
+  # Fetch the repository key BEFORE touching the working installation. The old order was
+  # purge-then-download, so any transient DNS/network blip left the machine with no AnyDesk
+  # at all -- and since main() called this step bare under `set -e`, the whole bootstrap
+  # aborted right here and Tailscale, registration and the readiness gate never ran.
+  # Observed on S-25011715S 2026-08-06: "curl: (6) Could not resolve host: keys.anydesk.com"
+  # one minute after the purge succeeded. Remote access is the one thing provisioning must
+  # never take away on its way to failing.
+  local keyring_tmp attempt
+  keyring_tmp="$(mktemp)"
+  for attempt in 1 2 3; do
+    if curl -fsSL --connect-timeout 15 --max-time 60 https://keys.anydesk.com/repos/DEB-GPG-KEY 2>/dev/null \
+         | gpg --dearmor -o "$keyring_tmp" 2>/dev/null && [ -s "$keyring_tmp" ]; then
+      log "AnyDesk repository key downloaded (attempt $attempt)"
+      break
+    fi
+    log "WARNING: AnyDesk repository key download failed (attempt $attempt/3)"
+    : >"$keyring_tmp"
+    [ "$attempt" -lt 3 ] && sleep 5
+  done
+
+  if [ ! -s "$keyring_tmp" ]; then
+    rm -f "$keyring_tmp"
+    record_warning "could not download the AnyDesk repository key — existing AnyDesk installation left UNTOUCHED and bootstrap continues"
+    return 0
+  fi
+
   log "Removing any existing AnyDesk installation (always reinstalling from scratch)"
   systemctl stop anydesk 2>/dev/null || true
   systemctl disable anydesk 2>/dev/null || true
@@ -666,31 +762,29 @@ reinstall_anydesk() {
 
   log "Adding AnyDesk repository"
   mkdir -p /etc/apt/keyrings
-  if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg; then
-    log "ERROR: failed to download or install AnyDesk repository key"
-    return 1
-  fi
+  install -m 0644 "$keyring_tmp" /etc/apt/keyrings/anydesk.gpg
+  rm -f "$keyring_tmp"
   echo "deb [signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" >/etc/apt/sources.list.d/anydesk.list
 
   log "Installing AnyDesk"
   apt-get update || {
-    log "ERROR: apt-get update failed after adding AnyDesk repository"
+    record_warning "apt-get update failed after adding the AnyDesk repository — AnyDesk NOT reinstalled"
     sed -n '1,120p' /etc/apt/sources.list.d/anydesk.list 2>/dev/null || true
-    return 1
+    return 0
   }
   apt_install anydesk || {
-    log "ERROR: AnyDesk package installation failed"
+    record_warning "AnyDesk package installation failed — machine has no AnyDesk, use RustDesk/Tailscale to reach it"
     apt-cache policy anydesk 2>/dev/null || true
-    return 1
+    return 0
   }
 
   systemctl daemon-reload
   systemctl enable anydesk
   if ! systemctl restart anydesk; then
-    log "ERROR: failed to restart AnyDesk"
+    record_warning "failed to restart AnyDesk after installing it"
     systemctl status anydesk --no-pager || true
     journalctl -u anydesk -n 100 --no-pager || true
-    return 1
+    return 0
   fi
   sleep 15
 
@@ -1937,7 +2031,9 @@ main() {
   install_freeze_protection
   configure_ssh
   install_ops_ssh_key
-  reinstall_anydesk
+  # Non-fatal on purpose: a remote-access step that fails must not abort provisioning before
+  # Tailscale, telemetry registration, fleet.json and the readiness gate have run.
+  reinstall_anydesk || record_warning "AnyDesk setup failed — continuing bootstrap without it"
   reinstall_rustdesk || log "RustDesk setup failed — non-critical, continuing bootstrap without it"
   configure_tailscale
 
