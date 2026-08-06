@@ -111,6 +111,19 @@ cleanup_strapi_password_file() {
 }
 trap on_exit EXIT
 
+# Transient DNS/connect failures are the single biggest cause of aborted runs on these
+# machines: the client router is the only resolver and drops roughly one lookup in twenty,
+# which is plenty to kill a run that makes dozens of calls. Two failures on 2026-08-06 were
+# exactly this -- "Could not resolve host: keys.anydesk.com" and curl exit 6 on
+# admin.ishaker.xyz/api/auth/local. The per-call retry loops that already existed could not
+# help: under `set -e` the failing status="$(curl ...)" assignment aborted the script before
+# the loop got to look at the status. So every such call now retries inside curl AND falls
+# back to "000" instead of killing the run.
+CURL_NET_OPTS="--connect-timeout 15 --max-time 90 --retry 3 --retry-delay 2"
+if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+  CURL_NET_OPTS="$CURL_NET_OPTS --retry-all-errors"   # curl >= 7.71; also retries DNS failures
+fi
+
 SETUP_WARNINGS=()
 record_warning() {
   SETUP_WARNINGS+=("$1")
@@ -1176,9 +1189,9 @@ PY
   response_file="$(mktemp)"
   local attempt delay=5
   for attempt in 1 2 3 4; do
-    status="$(curl -sS -o "$response_file" -w '%{http_code}' "$STRAPI_BASE_URL/api/auth/local" \
+    status="$(curl $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' "$STRAPI_BASE_URL/api/auth/local" \
       -H 'Content-Type: application/json' \
-      --data-binary "$auth_payload")"
+      --data-binary "$auth_payload" || echo 000)"; status="${status: -3}"
 
     if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
       python3 -c 'import json,sys; print(json.load(sys.stdin)["jwt"])' <"$response_file"
@@ -1212,13 +1225,13 @@ curl_json_logged() {
 
   for attempt in 1 2 3 4; do
     if [ -n "$payload" ]; then
-      status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
+      status="$(curl --globoff $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
         -H "Authorization: Bearer $token" \
         -H 'Content-Type: application/json' \
-        --data-binary "$payload")"
+        --data-binary "$payload" || echo 000)"; status="${status: -3}"
     else
-      status="$(curl --globoff -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
-        -H "Authorization: Bearer $token")"
+      status="$(curl --globoff $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' -X "$method" "$url" \
+        -H "Authorization: Bearer $token" || echo 000)"; status="${status: -3}"
     fi
 
     if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
@@ -1416,11 +1429,11 @@ manage_token() {
 
   local response_file status
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' "$MANAGE_KEYCLOAK_TOKEN_URL" \
+  status="$(curl $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' "$MANAGE_KEYCLOAK_TOKEN_URL" \
     --data-urlencode "grant_type=password" \
     --data-urlencode "client_id=$MANAGE_CLIENT_ID" \
     --data-urlencode "username=$MANAGE_USERNAME" \
-    --data-urlencode "password=$MANAGE_PASSWORD")"
+    --data-urlencode "password=$MANAGE_PASSWORD" || echo 000)"; status="${status: -3}"
 
   if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
     python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <"$response_file"
@@ -1444,9 +1457,9 @@ manage_machine_registered() {
   token="$(manage_token)" || return 1
 
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+  status="$(curl $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' \
     "$MANAGE_API_BASE/api/telemetry-machine-control/machine/list-serial-number/$org_id" \
-    -H "Authorization: Bearer $token")"
+    -H "Authorization: Bearer $token" || echo 000)"; status="${status: -3}"
 
   if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
     log "WARNING: could not fetch manage machine list for org $org_id (HTTP $status) — treating as not-yet-registered"
@@ -1478,9 +1491,9 @@ fetch_reg_code() {
   }
 
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' -X POST \
+  status="$(curl $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' -X POST \
     "$MANAGE_API_BASE/api/telemetry-machine-control/registration-code/create-or-get/$MANAGE_ORG_ID" \
-    -H "Authorization: Bearer $token")"
+    -H "Authorization: Bearer $token" || echo 000)"; status="${status: -3}"
 
   if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
     code="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("code") or "")' <"$response_file")"
@@ -1553,10 +1566,10 @@ print(json.dumps({
 ')"
 
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' -X POST \
+  status="$(curl $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' -X POST \
     "$MANAGE_API_BASE/api/telemetry-machine-control/machine/registration/$reg_code" \
     -H 'Content-Type: application/json' \
-    --data-binary "$payload")"
+    --data-binary "$payload" || echo 000)"; status="${status: -3}"
 
   if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
     secret_key="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("secretKey") or "")' <"$response_file")"
@@ -1883,10 +1896,10 @@ verify_telemetry_auth() {
   fi
   local response_file status
   response_file="$(mktemp)"
-  status="$(curl -sS -o "$response_file" -w '%{http_code}' "$TELEMETRY_KEYCLOAK_TOKEN_URL" \
+  status="$(curl $CURL_NET_OPTS -sS -o "$response_file" -w '%{http_code}' "$TELEMETRY_KEYCLOAK_TOKEN_URL" \
     --data-urlencode "grant_type=client_credentials" \
     --data-urlencode "client_id=$serial_number" \
-    --data-urlencode "client_secret=$machine_key")"
+    --data-urlencode "client_secret=$machine_key" || echo 000)"; status="${status: -3}"
   if [ "$status" -ge 200 ] && [ "$status" -lt 300 ] && \
      python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("access_token") else 1)' <"$response_file"; then
     rm -f "$response_file"
