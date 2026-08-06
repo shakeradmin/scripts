@@ -109,7 +109,7 @@ chmod 600 "$STRAPI_PASSWORD_FILE"
 cleanup_strapi_password_file() {
   rm -f "$STRAPI_PASSWORD_FILE"
 }
-trap cleanup_strapi_password_file EXIT
+trap on_exit EXIT
 
 SETUP_WARNINGS=()
 record_warning() {
@@ -129,12 +129,34 @@ log_section() {
   log "--------------------------------------------------------------"
 }
 
+# Failure state, so the run can report at the END what went wrong instead of leaving the
+# operator to scroll back through several thousand lines of apt output.
+BOOTSTRAP_FAILED=0
+FAILURE_LINE=""
+FAILURE_COMMAND=""
+FAILURE_EXIT=""
+BOOTSTRAP_SERIAL=""
+STRAPI_MACHINE_ID=""
+STAGE="starting up"
+
+# Human-readable label of what bootstrap was doing, so the failure report names the step and
+# not just a line number.
+set_stage() {
+  STAGE="$1"
+}
+
 on_error() {
   local line_no="$1"
   local command="$2"
   local exit_code="$3"
 
+  BOOTSTRAP_FAILED=1
+  FAILURE_LINE="$line_no"
+  FAILURE_COMMAND="$command"
+  FAILURE_EXIT="$exit_code"
+
   log "ERROR: bootstrap failed"
+  log "Stage: $STAGE"
   log "Exit code: $exit_code"
   log "Line: $line_no"
   log "Command: $command"
@@ -152,6 +174,113 @@ on_error() {
 }
 
 trap 'on_error "$LINENO" "$BASH_COMMAND" "$?"' ERR
+
+# What the operator actually needs the moment a run dies: can this machine still be reached,
+# and by which of the three channels. Printed on the console at the very end, not buried.
+print_remote_access() {
+  local ad_id ad_state rd_id rd_state ts_ip ts_host ts_state
+  ad_state="$(systemctl is-active anydesk 2>/dev/null || echo inactive)"
+  rd_state="$(systemctl is-active rustdesk 2>/dev/null || echo inactive)"
+  ts_state="$(systemctl is-active tailscaled 2>/dev/null || echo inactive)"
+  ad_id="$(get_anydesk_id 2>/dev/null || true)"
+  rd_id="$(get_rustdesk_id 2>/dev/null || true)"
+  ts_ip="$(get_tailscale_ip 2>/dev/null || true)"
+  ts_host="$(get_tailscale_hostname 2>/dev/null || true)"
+
+  echo "REMOTE ACCESS AVAILABLE ON THIS MACHINE"
+  printf '  AnyDesk    : %-10s id=%s\n'  "$ad_state" "${ad_id:-<none>}"
+  printf '  RustDesk   : %-10s id=%s\n'  "$rd_state" "${rd_id:-<none>}"
+  printf '  Tailscale  : %-10s ip=%s host=%s\n' "$ts_state" "${ts_ip:-<none>}" "${ts_host:-<none>}"
+  printf '  SSH        : %-10s user=%s port=%s\n' \
+    "$(systemctl is-active ssh 2>/dev/null || echo inactive)" "$SSH_LOGIN_USER" "$SSH_PORT"
+
+  if [ -z "$ad_id" ] && [ -z "$rd_id" ] && [ -z "$ts_ip" ]; then
+    echo "  !! NO REMOTE ACCESS CHANNEL CAME UP — this machine can only be reached on site."
+  fi
+}
+
+# A failed run used to leave no trace anywhere but the machine's own disk, so a box that died
+# mid-provisioning was invisible to the fleet. Register it anyway, with the reason in
+# admin_comment, so it shows up as a machine that needs attention.
+register_failed_machine() {
+  local serial reason ad_id rd_id ts_ip ts_host secret
+
+  [ -n "$STRAPI_MACHINE_ID" ] && return 0          # main() already created the record
+
+  serial="${BOOTSTRAP_SERIAL:-$(onbox_serial 2>/dev/null || true)}"
+  if [ -z "$serial" ]; then
+    log "no serial known — cannot register the failed run in Strapi"
+    return 0
+  fi
+  if [ -z "$STRAPI_PASSWORD" ] && [ ! -s "$STRAPI_PASSWORD_FILE" ]; then
+    log "no Strapi credentials available — cannot register the failed run in Strapi"
+    return 0
+  fi
+
+  reason="$(failure_report_text)"
+  ad_id="$(get_anydesk_id 2>/dev/null || true)"
+  rd_id="$(get_rustdesk_id 2>/dev/null || true)"
+  ts_ip="$(get_tailscale_ip 2>/dev/null || true)"
+  ts_host="$(get_tailscale_hostname 2>/dev/null || true)"
+  secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))' 2>/dev/null || echo "")"
+
+  # status stays "new" on purpose: the Strapi enum only knows new/working/ready, and a record
+  # rejected with a 400 would defeat the point of registering the failure at all. The reason
+  # lives in admin_comment.
+  log "Registering the FAILED bootstrap run in Strapi (serial $serial)"
+  if STRAPI_MACHINE_ID="$(ADMIN_COMMENT="$reason" \
+        register_machine_in_strapi "$serial" "$ad_id" "$ts_ip" "" "$rd_id" \
+        "$ts_host" "$(hostname)" "" "" "$secret" "${MACHINE_NICKNAME:-}" 2>/dev/null)"; then
+    log "Strapi machine created with the failure reason: id $STRAPI_MACHINE_ID"
+  else
+    STRAPI_MACHINE_ID=""
+    log "WARNING: could not register the failed run in Strapi either"
+  fi
+}
+
+failure_report_text() {
+  local out
+  out="bootstrap FAILED at stage: $STAGE"
+  [ -n "$FAILURE_COMMAND" ] && out="$out"$'\n'"failing command (line ${FAILURE_LINE}, exit ${FAILURE_EXIT}): $FAILURE_COMMAND"
+  if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
+    local w
+    out="$out"$'\n'"warnings:"
+    for w in "${SETUP_WARNINGS[@]}"; do out="$out"$'\n'"  - $w"; done
+  fi
+  printf '%s' "$out"
+}
+
+# Runs on every exit path, including the abort ones, so a failed run always ends with a
+# readable verdict on the console instead of the last apt error scrolling past.
+on_exit() {
+  local rc="$?"
+  set +u                               # the trap can fire before every global is assigned
+  cleanup_strapi_password_file
+  if [ "${BOOTSTRAP_FAILED:-0}" = "1" ] || { [ "$rc" -ne 0 ] && [ "${FINISHED_CLEANLY:-0}" != "1" ]; }; then
+    register_failed_machine || true
+    echo
+    echo "=============================================================="
+    echo "BOOTSTRAP FAILED"
+    echo "=============================================================="
+    echo "Stage           : ${STAGE:-unknown}"
+    [ -n "${FAILURE_COMMAND:-}" ] && echo "Failing command : $FAILURE_COMMAND"
+    [ -n "${FAILURE_LINE:-}" ]    && echo "Line / exit code: $FAILURE_LINE / $FAILURE_EXIT"
+    echo "Serial          : ${BOOTSTRAP_SERIAL:-<not entered>}"
+    echo "Strapi machine  : ${STRAPI_MACHINE_ID:-<not created>}"
+    echo "Log file        : $LOGFILE"
+    if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
+      echo
+      echo "WARNINGS (${#SETUP_WARNINGS[@]}):"
+      local w
+      for w in "${SETUP_WARNINGS[@]}"; do echo "  - $w"; done
+    fi
+    echo
+    print_remote_access
+    echo "=============================================================="
+  fi
+  set -u
+}
+FINISHED_CLEANLY=0
 
 run_logged() {
   log "Running: $*"
@@ -735,8 +864,11 @@ reinstall_anydesk() {
   local keyring_tmp attempt
   keyring_tmp="$(mktemp)"
   for attempt in 1 2 3; do
+    # --batch --yes is required: mktemp has already created keyring_tmp, and gpg refuses to
+    # write over an existing file, which would fail every attempt for a reason that has
+    # nothing to do with the network.
     if curl -fsSL --connect-timeout 15 --max-time 60 https://keys.anydesk.com/repos/DEB-GPG-KEY 2>/dev/null \
-         | gpg --dearmor -o "$keyring_tmp" 2>/dev/null && [ -s "$keyring_tmp" ]; then
+         | gpg --batch --yes --dearmor -o "$keyring_tmp" 2>/dev/null && [ -s "$keyring_tmp" ]; then
       log "AnyDesk repository key downloaded (attempt $attempt)"
       break
     fi
@@ -1214,6 +1346,8 @@ json_payload() {
   BOOTSTRAP_VERSION_VALUE="$BOOTSTRAP_VERSION" \
   UNITY_VERSION_VALUE="$UNITY_VERSION" \
   SSD_VERSION_VALUE="$SSD_VERSION" \
+  ADMIN_COMMENT_VALUE="${ADMIN_COMMENT:-}" \
+  MACHINE_STATUS_VALUE="${MACHINE_STATUS:-new}" \
   python3 - <<'PY'
 import json
 import os
@@ -1224,7 +1358,8 @@ def env_or_none(key):
 
 
 data = {
-    "status": "new",
+    "status": os.environ.get("MACHINE_STATUS_VALUE") or "new",
+    "admin_comment": env_or_none("ADMIN_COMMENT_VALUE"),
     "nickname": env_or_none("NICKNAME_VALUE"),
     "anydesk_id": env_or_none("ANYDESK_ID"),
     "serial_number": os.environ["MACHINE_SERIAL"],
@@ -1987,9 +2122,12 @@ start_kiosk_app() {
 }
 
 main() {
+  set_stage "loading configuration"
   protect_env_file
   load_env
+  set_stage "checking for root privileges"
   require_root
+  set_stage "scrubbing cloned-golden identity"
   scrub_clone_identity
 
   echo "=============================================================="
@@ -2016,25 +2154,37 @@ main() {
   log "MANAGE_USERNAME=$MANAGE_USERNAME"
   log "MANAGE_PASSWORD present: $([ -n "$MANAGE_PASSWORD" ] && echo yes || echo no)"
 
+  set_stage "waiting for the network"
   wait_for_online
+  set_stage "asking the operator for serial / nickname / machine type"
   local serial_number
   serial_number="$(prompt_for_serial_number)"
+  BOOTSTRAP_SERIAL="$serial_number"
   local nickname
   nickname="$(prompt_for_nickname)"
+  MACHINE_NICKNAME="${MACHINE_NICKNAME:-$nickname}"
   local machine_type_id
   machine_type_id="$(prompt_for_machine_type_id)"
 
+  set_stage "loading shared credentials from Strapi"
   load_creds_from_strapi || record_warning "could not load creds from Strapi cred entity — falling back to any locally-provided TAILSCALE_AUTHKEY/ANYDESK_PASSWORD"
 
+  set_stage "installing base packages"
   install_base_packages
+  set_stage "disabling unattended upgrades"
   disable_auto_updates
+  set_stage "installing freeze protection (c-state + watchdog)"
   install_freeze_protection
+  set_stage "configuring SSH"
   configure_ssh
   install_ops_ssh_key
   # Non-fatal on purpose: a remote-access step that fails must not abort provisioning before
   # Tailscale, telemetry registration, fleet.json and the readiness gate have run.
+  set_stage "installing AnyDesk"
   reinstall_anydesk || record_warning "AnyDesk setup failed — continuing bootstrap without it"
+  set_stage "installing RustDesk"
   reinstall_rustdesk || log "RustDesk setup failed — non-critical, continuing bootstrap without it"
+  set_stage "configuring Tailscale"
   configure_tailscale
 
   local anydesk_id rustdesk_id tailscale_ip tailscale_hostname now_iso machine_id reg_code machine_key machine_secret telemetry_machine_id redeem_output
@@ -2053,6 +2203,7 @@ main() {
   fi
   tailscale_hostname="$(get_tailscale_hostname)"
   now_iso="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  set_stage "registering the machine in telemetry (manage.ishakerusa.com org $MANAGE_ORG_ID)"
   reg_code="$(fetch_reg_code || true)"
   machine_key=""
   telemetry_machine_id=""
@@ -2072,7 +2223,17 @@ main() {
     apply_hard_settings_serial "$serial_number"
     verify_telemetry_auth "$serial_number" "$machine_key" || true
   fi
-  machine_id="$(register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret" "$nickname")"
+  set_stage "creating the Strapi machine record"
+  BOOTSTRAP_SERIAL="$serial_number"
+  # Carry whatever went wrong so far into the record, so a machine that limped through
+  # provisioning is visibly flagged instead of looking identical to a clean one.
+  if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
+    ADMIN_COMMENT="bootstrap completed with ${#SETUP_WARNINGS[@]} warning(s):$(printf '\n  - %s' "${SETUP_WARNINGS[@]}")"
+  else
+    ADMIN_COMMENT=""
+  fi
+  machine_id="$(ADMIN_COMMENT="$ADMIN_COMMENT" register_machine_in_strapi "$serial_number" "$anydesk_id" "$tailscale_ip" "$machine_type_id" "$rustdesk_id" "$tailscale_hostname" "$(hostname)" "$reg_code" "$machine_key" "$machine_secret" "$nickname")"
+  STRAPI_MACHINE_ID="$machine_id"
 
   # Unconditional and AFTER registration: the secret in this file is only valid once the
   # server has stored it, and the file must be written even when telemetry registration
@@ -2090,6 +2251,7 @@ main() {
 
   # Last, and blocking: provisioning is not "done" until something has verified the result
   # as a whole. Runs after every write above so it sees the machine exactly as it will ship.
+  set_stage "running the readiness gate"
   run_readiness_gate
 
   echo
@@ -2136,6 +2298,10 @@ main() {
   # Deliberately after the summary, so the operator gets to read it before ShakerView takes the
   # screen — but before the exit below, which would otherwise skip the kiosk on any warning.
   start_kiosk_app
+
+  # The run reached its own summary: `exit 2` below is "finished with warnings", not a crash,
+  # and must not make the EXIT trap print the BOOTSTRAP FAILED block on top of it.
+  FINISHED_CLEANLY=1
 
   if [ "${#SETUP_WARNINGS[@]}" -gt 0 ]; then
     echo
