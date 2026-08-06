@@ -514,39 +514,72 @@ serial_looks_wrong() {
   [[ "$s" =~ ^[0-9]{9,10}$ ]] && [[ "$s" != 2* ]]
 }
 
-prompt_for_serial_number() {
-  local serial="" onbox=""
-  onbox="$(onbox_serial)"
+# Console output that belongs NEXT TO the prompt. read_tty writes its prompt to /dev/tty, so
+# anything explaining that prompt has to go to the same place or it lands in the log only.
+say_tty() {
+  if [ -r /dev/tty ]; then
+    printf '%s\n' "$*" >/dev/tty
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
 
-  if [ -n "$MACHINE_SERIAL_NUMBER" ]; then
-    log "Using MACHINE_SERIAL_NUMBER from environment"
-    if [ -n "$onbox" ] && [ "$onbox" != "$MACHINE_SERIAL_NUMBER" ]; then
-      record_warning "MACHINE_SERIAL_NUMBER=$MACHINE_SERIAL_NUMBER differs from on-device hard_settings.MachineSerial=$onbox — the on-device value will be overwritten"
-    fi
+prompt_for_serial_number() {
+  local serial="" onbox="" default="" answer=""
+  onbox="$(onbox_serial)"
+  default="${MACHINE_SERIAL_NUMBER:-$onbox}"
+
+  # Always SHOW both serials and always let the operator confirm, even when .env supplies one.
+  # Silently trusting MACHINE_SERIAL_NUMBER meant the run never displayed the value that was
+  # about to be written into hard_settings and registered in the cabinet -- the one field
+  # nobody can check afterwards without opening the machine.
+  say_tty ""
+  say_tty "  ------------------------------------------------------------"
+  say_tty "  serial in configuration : ${MACHINE_SERIAL_NUMBER:-<not set>}"
+  say_tty "  serial on this machine  : ${onbox:-<none found>}"
+  if [ -n "$MACHINE_SERIAL_NUMBER" ] && [ -n "$onbox" ] && [ "$MACHINE_SERIAL_NUMBER" != "$onbox" ]; then
+    say_tty "  !! THEY DISAGREE — what you confirm below overwrites hard_settings.MachineSerial"
+    record_warning "MACHINE_SERIAL_NUMBER=$MACHINE_SERIAL_NUMBER differs from on-device hard_settings.MachineSerial=$onbox — the on-device value gets overwritten"
+  fi
+  say_tty "  ------------------------------------------------------------"
+  log "serial from configuration: ${MACHINE_SERIAL_NUMBER:-<unset>}; on-device: ${onbox:-<none>}"
+
+  # No terminal to confirm on (cron, piped install): fall back to the configured value rather
+  # than blocking forever on a read that can never be answered.
+  if [ ! -r /dev/tty ] && [ ! -t 0 ] && [ -n "$MACHINE_SERIAL_NUMBER" ]; then
+    log "no TTY to confirm on — using MACHINE_SERIAL_NUMBER unattended"
     printf "%s" "$MACHINE_SERIAL_NUMBER"
     return
   fi
 
-  [ -n "$onbox" ] && log "This machine currently reports MachineSerial: $onbox"
-
+  local tries=0
   while [ -z "$serial" ]; do
-    if [ -n "$onbox" ]; then
-      serial="$(read_tty "Enter machine serial_number [$onbox]: " | xargs)"
-      [ -z "$serial" ] && serial="$onbox"
+    tries=$((tries + 1))
+    # Bounded: if the terminal goes away mid-run, read returns empty forever and the old
+    # unbounded loop span at 100% CPU with nobody watching.
+    if [ "$tries" -gt 10 ]; then
+      say_tty "  no serial entered after 10 attempts — aborting"
+      log "ERROR: no serial number could be read from the terminal"
+      return 1
+    fi
+    if [ -n "$default" ]; then
+      answer="$(read_tty "  Serial to register [$default]: " | xargs)"
+      serial="${answer:-$default}"
     else
-      serial="$(read_tty "Enter machine serial_number: " | xargs)"
+      serial="$(read_tty "  Serial to register: " | xargs)"
     fi
 
     if [ -n "$serial" ] && serial_looks_wrong "$serial"; then
-      printf '\n  "%s" is %s bare digits — that is an AnyDesk ID, not a machine serial.\n' \
-        "$serial" "${#serial}" >&2
-      printf '  Machine serials look like S-25011715S / T2-25110041S / 25010056.\n' >&2
+      say_tty ""
+      say_tty "  \"$serial\" is ${#serial} bare digits — that is an AnyDesk ID, not a machine serial."
+      say_tty "  Machine serials look like S-25011715S / T2-25110041S / 25010056."
       if [ "$(read_tty "  Use it anyway? (yes/NO): " | xargs)" != "yes" ]; then
         serial=""
       fi
     fi
   done
 
+  log "serial confirmed by operator: $serial"
   printf "%s" "$serial"
 }
 
