@@ -192,6 +192,44 @@ def stable_firmwares(token):
         raise
 
 
+def all_firmwares(token):
+    """Every controller-firmware record, stable or not.
+
+    stable_firmwares() is the ROLLOUT list. This is the IDENTIFICATION list: the version
+    sitting on a board has to be nameable even when nobody has flipped its record to
+    isStable, otherwise machine.controller_firmware stays empty on exactly the machines
+    someone is trying to check.
+    """
+    q = ("/api/controller-firmwares?populate[machine_types]=*"
+         "&pagination[pageSize]=100")
+    try:
+        return [dict(id=e["id"], **e["attributes"]) for e in api(q, token)["data"]]
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 404):
+            return []
+        raise
+
+
+def firmware_record_for(all_fws, machine, version):
+    """The record that NAMES the version read back off this machine's controller.
+
+    Tagged by machine_type exactly like pick_firmware(), so an S image is never attributed
+    to a Touch just because the version strings happen to line up. Returns None when no
+    record describes what the board reports -- which is itself the honest answer.
+    """
+    if not version:
+        return None
+    mt = (machine.get("machine_type") or {}).get("data")
+    mt_id = mt["id"] if mt else None
+    for f in all_fws:
+        if f.get("version") != version:
+            continue
+        types = (f.get("machine_types") or {}).get("data") or []
+        if mt_id in [t["id"] for t in types]:
+            return f["id"]
+    return None
+
+
 def machines(token, only=None):
     q = ("/api/machines?pagination[pageSize]=200&populate[machine_type]=*"
          "&populate[controller_firmware]=*")
@@ -635,6 +673,7 @@ def main():
     token = lpm.strapi_login(ident, env["STRAPI_MACHINE_USER_PASSWORD"])
 
     fws = stable_firmwares(token)
+    all_fws = all_firmwares(token)
     # No early return when there is nothing to roll out. Reading and recording every
     # machine's controller version is useful on its own — it is the only fleet-wide
     # inventory of what is actually on the boards — and it must not be gated on someone
@@ -653,8 +692,21 @@ def main():
         name, line, status = sweep_one(m, fws, token, a.dry_run, a.report, budget)
         if status and STRAPI_HAS_SCHEMA:
             try:
-                api_put(f"/api/machines/{m['id']}", token,
-                        {"controller_fw": status.get("read"), "controller_fw_status": status})
+                payload = {"controller_fw": status.get("read"),
+                           "controller_fw_status": status}
+                # machine.controller_firmware is the plain answer to "which firmware is on
+                # this machine", the way machine.patch is for software. It is set ONLY from
+                # the version read back off the controller -- never from what we intended to
+                # flash -- so it can never claim an install that did not happen, and it is
+                # cleared again when the board reports something no record names.
+                cur_rel = ((m.get("controller_firmware") or {}).get("data") or {}) or {}
+                cur_rel = cur_rel.get("id")
+                want_rel = firmware_record_for(all_fws, m, status.get("read"))
+                if cur_rel != want_rel:
+                    payload["controller_firmware"] = want_rel
+                    log(f"{name}: Strapi controller_firmware {cur_rel} -> {want_rel} "
+                        f"(reads {status.get('read')})")
+                api_put(f"/api/machines/{m['id']}", token, payload)
             except Exception as e:
                 log(f"{name}: strapi write failed: {e}")
         if status and status.get("action") not in (None, "up to date",
