@@ -38,7 +38,13 @@ TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
 TAILSCALE_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
 TAILSCALE_ADVERTISE_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
 RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
-ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
+# Tailscale SSH ON by default (2026-09-10). With it, sshd is bypassed on the tailnet and the
+# connection is authorised by TAILNET IDENTITY — there is no key that can go stale. With it OFF
+# the only way in is the ops pubkey that bootstrap copies into authorized_keys ONCE and nothing
+# ever reconciles, so regenerating the workstation key locks the machine out permanently and
+# over the very channel you would need to repair it. That happened on 2026-09-09: every machine
+# still answering was one that had had this flag set by hand, every machine refusing had it off.
+ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-true}"
 SSH_LOGIN_USER="${SSH_LOGIN_USER:-}"
 SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
 SSH_PORT="${SSH_PORT:-22}"
@@ -333,7 +339,7 @@ load_env() {
   TAILSCALE_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
   TAILSCALE_ADVERTISE_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
   RESET_TAILSCALE_STATE="${RESET_TAILSCALE_STATE:-false}"
-  ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-false}"
+  ENABLE_TAILSCALE_SSH="${ENABLE_TAILSCALE_SSH:-true}"
   SSH_LOGIN_USER="${SSH_LOGIN_USER:-${SUDO_USER:-$(id -un)}}"
   SSH_AUTH_MODE="${SSH_AUTH_MODE:-password}"
   SSH_PORT="${SSH_PORT:-22}"
@@ -368,11 +374,20 @@ require_root() {
   fi
 }
 
+# [ -r /dev/tty ] only tests the device node's permissions, and that node exists for every
+# process. Opening it is what fails (ENXIO) when the process has no controlling terminal --
+# cron, a piped install, anything under setsid. So every "is there a terminal?" test below
+# used to take the TTY path and then die on its first write, including the unattended
+# fallback that exists precisely for those runs. Probe by actually opening it.
+tty_available() {
+  { : >/dev/tty; } 2>/dev/null
+}
+
 read_tty() {
   local prompt="$1"
   local value
 
-  if [ -r /dev/tty ]; then
+  if tty_available; then
     printf "%s" "$prompt" >/dev/tty
     IFS= read -r value </dev/tty
   else
@@ -386,7 +401,7 @@ read_secret_tty() {
   local prompt="$1"
   local value
 
-  if [ -r /dev/tty ]; then
+  if tty_available; then
     printf "%s" "$prompt" >/dev/tty
     IFS= read -rs value </dev/tty
     printf "\n" >/dev/tty
@@ -536,7 +551,7 @@ serial_looks_wrong() {
 # Console output that belongs NEXT TO the prompt. read_tty writes its prompt to /dev/tty, so
 # anything explaining that prompt has to go to the same place or it lands in the log only.
 say_tty() {
-  if [ -r /dev/tty ]; then
+  if tty_available; then
     printf '%s\n' "$*" >/dev/tty
   else
     printf '%s\n' "$*" >&2
@@ -584,7 +599,7 @@ prompt_for_serial_number() {
 
   # No terminal to confirm on (cron, piped install): fall back to the configured value rather
   # than blocking forever on a read that can never be answered -- but only if it is legal.
-  if [ ! -r /dev/tty ] && [ ! -t 0 ]; then
+  if ! tty_available && [ ! -t 0 ]; then
     if [ -n "$MACHINE_SERIAL_NUMBER" ] && serial_is_valid "$MACHINE_SERIAL_NUMBER"; then
       log "no TTY to confirm on — using MACHINE_SERIAL_NUMBER unattended"
       printf "%s" "$MACHINE_SERIAL_NUMBER"
@@ -695,6 +710,18 @@ generate_password() {
   else
     date +%s%N | sha256sum | cut -c1-24
   fi
+}
+
+# RustDesk creds are per-machine, never fleet-wide: the client of that machine is given this
+# password so they can watch their own kiosk from the RustDesk phone app. Six characters, from an
+# alphabet with no 0/o/1/l/i, so it survives being read out over the phone. RustDesk only enforces
+# a minimum length in its GUI -- the CLI takes six without complaint.
+generate_rustdesk_password() {
+  python3 - <<'PY'
+import secrets
+alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+print("".join(secrets.choice(alphabet) for _ in range(6)))
+PY
 }
 
 set_anydesk_password() {
@@ -836,8 +863,24 @@ install_freeze_protection() {
       fi
       # Prove it actually DETECTS faults rather than merely running. The suite feeds synthetic
       # conditions to health_check and touches only /tmp.
+      #
+      # PRECONDITIONS, and they are not optional. Three of the five cases compare against a
+      # HEALTHY baseline, so the suite only means anything when the kiosk is actually up:
+      #   * ShakerView running — otherwise health_check answers "ShakerView process not running"
+      #     to every case, and only case 4 (which expects exactly that) passes. That is the
+      #     "1 passed, 4 failed" warning bootstrap raised on machine 110 (25010056) on
+      #     2026-08-07: the app had not been started yet at that point in the run. Re-run
+      #     afterwards on the same machine, untouched: 5 passed, 0 failed.
+      #   * root — health_check reaches the X server through setpriv, so an unprivileged run
+      #     reports "X server unresponsive (xset q failed)" on both baseline cases (3/2).
+      # Failing either precondition says nothing about the watchdog, so it must not be
+      # reported as a defect: a warning nobody can act on is how real ones get ignored.
       if fetch_repo_file "watchdog/shakerview-watchdog.test.sh" "$tmp_test" >/dev/null; then
-        if bash "$tmp_test" >/tmp/wd_test_out 2>&1; then
+        if [ "$(id -u)" -ne 0 ]; then
+          log "watchdog self-test skipped: needs root (health_check reaches X via setpriv)"
+        elif ! pgrep -f 'ShakerView2.0.x86_64$' >/dev/null 2>&1; then
+          log "watchdog self-test skipped: ShakerView is not running yet — the suite's HEALTHY baseline cannot exist. Re-run by hand once the kiosk is up: sudo bash shakerview-watchdog.test.sh"
+        elif bash "$tmp_test" >/tmp/wd_test_out 2>&1; then
           log "watchdog self-test: $(grep -oE '[0-9]+ passed, [0-9]+ failed' /tmp/wd_test_out | tail -1)"
         else
           record_warning "watchdog SELF-TEST FAILED ($(grep -oE '[0-9]+ passed, [0-9]+ failed' /tmp/wd_test_out | tail -1)) — it runs but may not detect a real freeze"
@@ -1076,7 +1119,13 @@ reinstall_rustdesk() {
   apt-get purge -y rustdesk || true
   apt-get autoremove -y || true
   rm -rf /etc/rustdesk /usr/share/rustdesk /var/log/rustdesk
-  rm -rf "/home/${SUDO_USER:-$SSH_LOGIN_USER}/.config/rustdesk"
+  # The identity (enc_id -> the RustDesk ID) lives in RustDesk.toml under the *service* account,
+  # i.e. /root, and apt purge leaves it behind. Skipping it is how clones ended up sharing one ID:
+  # ninja (26041829) and snow (26041830) both answered 201579898 with byte-identical enc_id, and on
+  # the rendezvous server the last one to register wins. Wipe root's copy and every user's copy so
+  # the reinstall mints a fresh identity.
+  rm -rf /root/.config/rustdesk
+  rm -rf /home/*/.config/rustdesk
   rm -f /tmp/rustdesk-install.deb
 
   local arch rd_arch deb_url
@@ -1139,12 +1188,14 @@ print(best)
   fi
 
   if [ -z "$RUSTDESK_PASSWORD" ]; then
-    RUSTDESK_PASSWORD="25410201ubuntu"
-    log "No RUSTDESK_PASSWORD available (env/Strapi cred); using fleet default"
+    RUSTDESK_PASSWORD="$(generate_rustdesk_password)"
+    log "Generated a per-machine RustDesk password (stored in Strapi machines.rustdesk_password)"
+  else
+    log "Using the RUSTDESK_PASSWORD supplied by the operator"
   fi
 
   log "Setting RustDesk unattended-access password"
-  set_rustdesk_password "$RUSTDESK_PASSWORD" || true
+  set_rustdesk_password "$RUSTDESK_PASSWORD" || record_warning "RustDesk password was not applied — do not hand this machine's creds to a client until it is"
 }
 
 get_rustdesk_id() {
@@ -1156,6 +1207,69 @@ get_rustdesk_id() {
     log "RustDesk ID detected: $id_value"
   fi
   printf "%s" "$id_value"
+}
+
+# Drop this machine's RustDesk identity and let the service mint a new one. Used when the ID we
+# ended up with is already claimed by another machine in Strapi (inherited from the golden image).
+reset_rustdesk_identity() {
+  log "Resetting RustDesk identity (stopping service, dropping RustDesk.toml)"
+  systemctl stop rustdesk 2>/dev/null || true
+  rm -f /root/.config/rustdesk/RustDesk.toml || true
+  rm -f /home/*/.config/rustdesk/RustDesk.toml || true
+  systemctl start rustdesk 2>/dev/null || true
+  sleep 10
+  if [ "$(systemctl is-active rustdesk 2>/dev/null || echo inactive)" != "active" ]; then
+    log "WARNING: RustDesk service did not come back up after the identity reset"
+  fi
+}
+
+# Which OTHER Strapi machines already claim this RustDesk ID? Prints their ids, empty when free.
+rustdesk_id_owners() {
+  local id_value="$1" token response
+  if [ -z "$id_value" ]; then
+    return 0
+  fi
+  token="$(strapi_token)" || return 0
+  response="$(curl_json_logged GET "$STRAPI_BASE_URL/api/machines?filters[rustdesk_id][\$eq]=$id_value&fields[0]=serial_number" "$token")" || return 0
+  echo "$response" | python3 -c 'import json,sys
+d = json.load(sys.stdin).get("data") or []
+print(",".join(str(i["id"]) for i in d))' 2>/dev/null || true
+}
+
+# A RustDesk ID is only useful if it points at exactly one machine. Bootstrap runs on freshly
+# cloned disks, so the ID we read first is very often the golden image's -- take it, check it
+# against Strapi, and reset the identity until it is ours alone.
+# Sets RUSTDESK_ID_RESULT rather than printing it: this has to run in the caller's shell so that
+# record_warning() lands in the end-of-run summary instead of dying with a $( ) subshell.
+RUSTDESK_ID_RESULT=""
+get_unique_rustdesk_id() {
+  local attempt id_value owners
+  RUSTDESK_ID_RESULT=""
+  for attempt in 1 2 3; do
+    id_value="$(get_rustdesk_id)"
+    if [ -z "$id_value" ]; then
+      return 0
+    fi
+    owners="$(rustdesk_id_owners "$id_value")"
+    if [ -z "$owners" ]; then
+      if [ "$attempt" -gt 1 ]; then
+        log "RustDesk ID $id_value is unique after $((attempt - 1)) reset(s)"
+      fi
+      RUSTDESK_ID_RESULT="$id_value"
+      return 0
+    fi
+    log "RustDesk ID $id_value is already registered to Strapi machine(s) $owners — clone-inherited identity"
+    if [ "$attempt" -eq 3 ]; then
+      record_warning "RustDesk ID $id_value still collides with machine(s) $owners after 2 identity resets — remote access to this machine and to $owners is unreliable until it is fixed by hand"
+      return 0
+    fi
+    reset_rustdesk_identity
+    # The password lives in the same file we just deleted, so it has to be re-applied.
+    if [ -n "$RUSTDESK_PASSWORD" ]; then
+      log "Re-applying the RustDesk password after the identity reset"
+      set_rustdesk_password "$RUSTDESK_PASSWORD" || record_warning "RustDesk password was not re-applied after the identity reset"
+    fi
+  done
 }
 
 install_tailscale() {
@@ -1366,9 +1480,12 @@ load_creds_from_strapi() {
     log "Loaded ANYDESK_PASSWORD from Strapi cred entity"
   fi
 
-  if [ -z "$RUSTDESK_PASSWORD" ] && [ -n "$rustdesk_password" ]; then
-    RUSTDESK_PASSWORD="$rustdesk_password"
-    log "Loaded RUSTDESK_PASSWORD from Strapi cred entity"
+  # Deliberately NOT applied: creds.RUSTDESK_PASSWORD is the one fleet-wide password, and handing
+  # that to a client would expose every other machine. Each machine now generates its own, and
+  # machines.rustdesk_password is the record of it. Kept readable here only so an operator who
+  # exports RUSTDESK_PASSWORD by hand still wins.
+  if [ -n "$rustdesk_password" ] && [ "$RUSTDESK_PASSWORD" = "$rustdesk_password" ]; then
+    log "NOTE: RUSTDESK_PASSWORD matches the fleet-wide cred entity value — this machine will share it with the rest of the fleet"
   fi
 
   if [ -z "$MANAGE_PASSWORD" ] && [ -n "$telemetry_password" ]; then
@@ -2291,9 +2408,10 @@ main() {
   if [ -z "$anydesk_id" ]; then
     record_warning "AnyDesk ID is unavailable from anydesk --get-id"
   fi
-  rustdesk_id="$(get_rustdesk_id)"
+  get_unique_rustdesk_id
+  rustdesk_id="$RUSTDESK_ID_RESULT"
   if [ -z "$rustdesk_id" ]; then
-    log "WARNING: RustDesk ID is unavailable from rustdesk --get-id (non-critical)"
+    log "WARNING: no usable RustDesk ID (unavailable, or still colliding with another machine) — non-critical"
   fi
   tailscale_ip="$(get_tailscale_ip)"
   if [ -z "$tailscale_ip" ]; then

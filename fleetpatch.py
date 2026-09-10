@@ -34,6 +34,19 @@ impossible to miss. Verified by md5 before it is shipped anywhere. Beside it,
 <patched_md5>.managed holds the reference-set fingerprint for check (5); no sidecar
 means no install, because compatibility must never be guessed.
 
+MULTI-DLL PATCHES: some patches are a SET, not one assembly — patch 26 moves the first
+screen to product tiles in CommonCode.dll AND Assembly-CSharp.dll, and either half alone
+is a broken kiosk. Such a patch declares its members in <patched_md5>.parts, one
+`<destination-file> <md5>` per line, each member stored as <md5>.dll beside it. Install,
+verification and rollback then cover every member atomically. No .parts file means the
+historical single-CommonCode behaviour, unchanged.
+
+The base gate (4) is still read from CommonCode's md5 alone: that is the assembly whose
+lineage base_md5 documents. The other members are full cumulative replacements, so their
+predecessor does not constrain the install — check (5) is what guards ABI compatibility.
+Note that a member swap MOVES the machine's Managed/ fingerprint (Assembly-CSharp.dll is
+inside it), so the sidecar must list both the pre-install and post-install sets.
+
 PER MACHINE:
   backup live dll -> stop watchdog -> copy -> canonical restart (exact pid, AppManager
   relaunches) -> wait -> verify. Verification requires ALL of: process alive, PatchDiag
@@ -211,7 +224,120 @@ def candidate_machines(token):
     return out
 
 
-def pick_patch(patches, machine, live_md5=None):
+def read_sidecar(path):
+    """Reference sets an artifact is declared compatible with, one fingerprint per line.
+
+    Historically a sidecar held exactly one fingerprint and the gate was equality. That is
+    too strict once a machine carries a per-target build of an assembly CommonCode does not
+    reference: patch 24 replaces Assembly-CSharp.dll and ParametersScreen.dll, neither of
+    which appears in CommonCode's extern list, so its type resolution is provably unaffected
+    -- yet the fingerprint changes and the machine silently drops out of every CommonCode
+    rollout (004, crane, 112, 113 on 2026-08-11).
+
+    So a sidecar is now a LIST: every line is a reference set this artifact may be installed
+    against. Still an explicit allow-list, never a guess -- an unknown set is refused exactly
+    as before. Blank lines and #-comments are ignored.
+    """
+    out = []
+    for line in open(path):
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def artifact_fingerprints(patch):
+    """The reference sets an artifact was declared compatible with, from its .managed sidecar."""
+    want = first_md5(patch["attributes"].get("patched_md5"))
+    if not want:
+        return None
+    sidecar = os.path.join(ARTIFACT_ROOT, f"{want}.managed")
+    if not os.path.exists(sidecar):
+        return None
+    return read_sidecar(sidecar) or None
+
+
+def declares_multiple_files(patched_md5):
+    """True if patched_md5 names more than one build — i.e. the patch is a SET.
+
+    This is a guard against the shape that patches 27 and 28 have: their patched_md5 opens
+    with an ASSEMBLY-CSHARP hash, so the historical single-artifact path would have fetched
+    <that md5>.dll and written those bytes over CommonCode.dll. Nothing but the artifact
+    being unpublished stood between that record and a bricked kiosk. A set must come with a
+    manifest saying where each member goes; without one we refuse rather than guess.
+    """
+    return len(set(re.findall(r"\b[0-9a-f]{32}\b", patched_md5 or ""))) > 1
+
+
+def read_parts(want, patched_md5=None):
+    """The files this patch installs: [{"dest", "md5", "path"}], CommonCode.dll first.
+
+    A patch is normally one assembly and the artifact IS that assembly. A multi-DLL patch
+    ships a <patched_md5>.parts manifest instead — `<destination-file> <md5>` per line —
+    because half of patch 26 (CommonCode without its Assembly-CSharp) is not a working
+    kiosk, it is a kiosk that boots and then draws the old screen against new data.
+
+    Returns None if the manifest names something that is not on disk or does not hash to
+    the md5 it claims; the caller refuses to install rather than shipping a partial set.
+    """
+    manifest = os.path.join(ARTIFACT_ROOT, f"{want}.parts")
+    if not os.path.exists(manifest):
+        if declares_multiple_files(patched_md5):
+            log(f"patch declares several builds in patched_md5 but has no {want}.parts "
+                f"manifest — refusing to treat {want[:8]} as a lone CommonCode.dll")
+            return None
+        return [{"dest": "CommonCode.dll", "md5": want,
+                 "path": os.path.join(ARTIFACT_ROOT, f"{want}.dll")}]
+    parts = []
+    for line in open(manifest):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        dest, _, md5 = line.partition(" ")
+        md5 = md5.strip()
+        if not re.fullmatch(r"[0-9a-f]{32}", md5 or ""):
+            log(f"ABORT: {manifest}: line '{line}' has no md5")
+            return None
+        parts.append({"dest": dest, "md5": md5,
+                      "path": os.path.join(ARTIFACT_ROOT, f"{md5}.dll")})
+    if not any(p["dest"] == "CommonCode.dll" for p in parts):
+        log(f"ABORT: {manifest} does not include CommonCode.dll — base gate would have "
+            f"nothing to check")
+        return None
+    # CommonCode first: it is the one the base gate and the Strapi record are written about.
+    parts.sort(key=lambda p: p["dest"] != "CommonCode.dll")
+    return parts
+
+
+def parts_present(parts):
+    """Every member on disk and hashing to its declared md5. All or nothing.
+
+    Returns ("ok"|"missing"|"corrupt", message). The two failures are NOT the same: a
+    missing artifact is an unpublished patch and only this machine is skipped, while a file
+    that does not hash to its name is a corrupted or mislabelled artifact and must stop the
+    whole run before it reaches a kiosk.
+    """
+    for p in parts:
+        if not os.path.exists(p["path"]):
+            return "missing", f"artifact missing: {p['path']} ({p['dest']})"
+        if md5_of(p["path"]) != p["md5"]:
+            return "corrupt", f"artifact {p['path']} does not match declared md5 {p['md5']}"
+    return "ok", ""
+
+
+def remote_md5s(target, names):
+    """md5 of each named file in Managed/, as {name: md5}. Missing files are omitted."""
+    listed = " ".join(f"{SV_DIR}/Managed/{n}" for n in names)
+    rc, out = ssh(target, f"md5sum {listed} 2>/dev/null")
+    got = {}
+    for line in (out or "").splitlines():
+        bits = line.split()
+        if len(bits) == 2 and re.fullmatch(r"[0-9a-f]{32}", bits[0]):
+            got[os.path.basename(bits[1])] = bits[0]
+    return got
+
+
+def pick_patch(patches, machine, live_md5=None, live_fp=None):
     """Highest stable patch this machine can actually take.
 
     `machine_type` alone stopped being enough the moment two lineages shipped stable patches
@@ -237,8 +363,17 @@ def pick_patch(patches, machine, live_md5=None):
         # Already on it: that IS the right patch, nothing to do downstream.
         if live_md5 == first_md5(a.get("patched_md5")):
             return p
-        if live_md5 in all_md5(a.get("base_md5")):
-            return p
+        if live_md5 not in all_md5(a.get("base_md5")):
+            continue
+        # The base list is not enough on its own. A machine whose reference set has drifted
+        # (hand-edited Assembly-CSharp, a per-target lineage) still matches the generic
+        # patch's bases, and stopping there left it skipped on a fingerprint mismatch instead
+        # of falling through to the per-target patch built FOR it -- machine 94 picked patch
+        # 21 and was dropped while patch 20, its own build, sat lower in the list.
+        want_fps = artifact_fingerprints(p)
+        if live_fp and want_fps and live_fp not in want_fps:
+            continue
+        return p
     # Nothing accepts this build. Return the newest for its type so the log still names a
     # patch and prints its base list -- that message is how a missing base gets noticed.
     return candidates[0]
@@ -284,10 +419,12 @@ def kiosk_idle(target):
     return False, "cannot tell whether the kiosk is in use (no CurrentScreen, no attract frames)"
 
 
-def verify(target, want_md5):
-    rc, live = ssh(target, f"md5sum {SV_DIR}/Managed/CommonCode.dll | cut -d' ' -f1")
-    if rc != 0 or live.strip() != want_md5:
-        return False, f"md5 mismatch after copy: {live.strip()[:12]}"
+def verify(target, parts):
+    got = remote_md5s(target, [p["dest"] for p in parts])
+    for p in parts:
+        if got.get(p["dest"]) != p["md5"]:
+            return False, (f"md5 mismatch after copy: {p['dest']} is "
+                           f"{(got.get(p['dest']) or 'missing')[:12]}, want {p['md5'][:12]}")
 
     # Wait for the app rather than demanding it be up already. AppManager gained a
     # RESTART_DELAY grace (40s) in 2026-07-29, deliberately, so a technician who closes the
@@ -327,7 +464,7 @@ def verify(target, want_md5):
     return True, "ok"
 
 
-def install(machine, patch, artifact, dry_run, force):
+def install(machine, patch, parts, dry_run, force):
     # Everything below tolerates ssh() returning a non-zero rc instead of raising.
     target = f"{machine['user']}@{machine['ip']}"
     want = first_md5(patch["attributes"].get("patched_md5"))
@@ -339,23 +476,34 @@ def install(machine, patch, artifact, dry_run, force):
         return "unreachable", f"{tag}: unreachable"
     live = live.strip()
 
-    if live == want:
+    # "Already on it" must mean EVERY member, not just CommonCode. A machine that took the
+    # CommonCode half of a pair and is missing the other one is the exact broken state this
+    # manifest exists to prevent — reporting it as current would make the damage permanent.
+    got = remote_md5s(target, [p["dest"] for p in parts])
+    stale = [p["dest"] for p in parts if got.get(p["dest"]) != p["md5"]]
+    if not stale:
         return "current", f"{tag}: already on {want[:8]}"
+    if live == want and stale:
+        log(f"{tag}: CommonCode is already {want[:8]} but {', '.join(stale)} is not — "
+            f"completing the set")
 
-    # Compatibility, checked in the order that fails cheapest.
+    # Compatibility, checked in the order that fails cheapest. `live == want` here means we
+    # are finishing a half-installed set, and base_md5 lists PREDECESSORS — the patch's own
+    # output is not one of them, so the gate must not be applied to it.
     accepted = all_md5(patch["attributes"].get("base_md5"))
-    if live not in accepted:
+    if live != want and live not in accepted:
         return "skip", (f"{tag}: live {live[:8]} is not an accepted base for this patch "
                         f"({', '.join(b[:8] for b in accepted) or 'none listed'}) — skipped")
 
     # The decisive one: the artifact was compiled against a specific reference set.
-    sidecar = os.path.splitext(artifact)[0] + ".managed"
+    sidecar = os.path.join(ARTIFACT_ROOT, f"{want}.managed")
     if os.path.exists(sidecar):
-        want_fp = open(sidecar).read().strip()
+        want_fps = read_sidecar(sidecar)
         live_fp = managed_fingerprint_remote(target)
-        if live_fp != want_fp:
-            return "skip", (f"{tag}: Managed/ fingerprint {(live_fp or '?')[:8]} != artifact's "
-                            f"{want_fp[:8]} — different reference set, would risk TypeLoadException")
+        if live_fp not in want_fps:
+            return "skip", (f"{tag}: Managed/ fingerprint {(live_fp or '?')[:8]} not in artifact's "
+                            f"accepted set ({', '.join(f[:8] for f in want_fps) or 'empty'}) — "
+                            f"different reference set, would risk TypeLoadException")
     else:
         return "skip", f"{tag}: no .managed sidecar for the artifact — refusing to guess compatibility"
 
@@ -365,35 +513,54 @@ def install(machine, patch, artifact, dry_run, force):
             return "busy", f"{tag}: {why}"
 
     if dry_run:
-        return "would", f"{tag}: WOULD install {want[:8]} over {live[:8]}"
+        what = ", ".join(f"{p['dest']}={p['md5'][:8]}" for p in parts)
+        return "would", f"{tag}: WOULD install {what} over CommonCode {live[:8]}"
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    backup = f"{SV_DIR}/Managed/CommonCode.dll.pre-fleetpatch-{ts}"
-    ssh(target, f"cp {SV_DIR}/Managed/CommonCode.dll {backup}")
+    # Back up EVERY member before touching any of them, so a rollback restores the set the
+    # machine actually had. Restoring only CommonCode would leave the other half installed.
+    for p in parts:
+        p["backup"] = f"{SV_DIR}/Managed/{p['dest']}.pre-fleetpatch-{ts}"
+        ssh(target, f"cp {SV_DIR}/Managed/{p['dest']} {p['backup']}")
     ssh(target, "sudo -n systemctl stop shakerview-watchdog 2>/dev/null || true")
 
-    r = subprocess.run(["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
-                        artifact, f"{target}:/tmp/fp.dll"], capture_output=True, text=True, timeout=180)
-    if r.returncode != 0:
-        ssh(target, "sudo -n systemctl start shakerview-watchdog 2>/dev/null || true")
-        return "fail", f"{tag}: scp failed: {r.stderr[-120:]}"
+    def rollback(why):
+        log(f"{tag}: VERIFY FAILED ({why}) — rolling back")
+        for q in parts:
+            if q.get("backup"):
+                ssh(target, f"cp {q['backup']} {SV_DIR}/Managed/{q['dest']}")
+        ssh(target, f"PID=$(ps -eo pid=,cmd= | awk '$2==\"{SV_BIN}\"{{print $1;exit}}'); "
+                    f"[ -n \"$PID\" ] && kill $PID")
+        time.sleep(RESTART_WAIT)
 
-    ssh(target, f"cp /tmp/fp.dll {SV_DIR}/Managed/CommonCode.dll && rm -f /tmp/fp.dll")
+    # Ship every member to /tmp FIRST, then move them all into place. A patch set must not
+    # be half-applied because the second scp timed out on a slow link.
+    for p in parts:
+        r = subprocess.run(["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                            p["path"], f"{target}:/tmp/fp-{p['md5']}.dll"],
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            ssh(target, "rm -f /tmp/fp-*.dll")
+            ssh(target, "sudo -n systemctl start shakerview-watchdog 2>/dev/null || true")
+            return "fail", f"{tag}: scp of {p['dest']} failed: {r.stderr[-120:]}"
+
+    for p in parts:
+        ssh(target, f"cp /tmp/fp-{p['md5']}.dll {SV_DIR}/Managed/{p['dest']}")
+    ssh(target, "rm -f /tmp/fp-*.dll")
+
     # Canonical restart: exact pid only. A pattern kill also matches AppManager's own
     # script text and takes the watchdog down with the app.
     ssh(target, f"PID=$(ps -eo pid=,cmd= | awk '$2==\"{SV_BIN}\"{{print $1;exit}}'); [ -n \"$PID\" ] && kill $PID")
     time.sleep(RESTART_WAIT)
     ssh(target, "sudo -n systemctl start shakerview-watchdog 2>/dev/null || true")
 
-    ok, why = verify(target, want)
+    ok, why = verify(target, parts)
     if not ok:
-        log(f"{tag}: VERIFY FAILED ({why}) — rolling back")
-        ssh(target, f"cp {backup} {SV_DIR}/Managed/CommonCode.dll")
-        ssh(target, f"PID=$(ps -eo pid=,cmd= | awk '$2==\"{SV_BIN}\"{{print $1;exit}}'); [ -n \"$PID\" ] && kill $PID")
-        time.sleep(RESTART_WAIT)
+        rollback(why)
         return "fail", f"{tag}: rolled back to {live[:8]} — {why}"
 
-    return "ok", f"{tag}: installed {want[:8]} (backup {os.path.basename(backup)})"
+    what = ", ".join(f"{p['dest']}={p['md5'][:8]}" for p in parts)
+    return "ok", f"{tag}: installed {what} (backups .pre-fleetpatch-{ts})"
 
 
 # ---------------------------------------------------------------- main
@@ -465,22 +632,27 @@ def main():
             if rc == 0:
                 live_md5 = out.strip() or None
 
-        p = pick_patch(patches, m, live_md5)
+        live_fp = managed_fingerprint_remote(f"{m['user']}@{m['ip']}") if m.get("ip") else None
+        p = pick_patch(patches, m, live_md5, live_fp)
         if not p:
             log(f"machine {m['id']}: no stable patch for its machine_type")
             continue
 
         want = first_md5(p["attributes"].get("patched_md5"))
-        artifact = os.path.join(ARTIFACT_ROOT, f"{want}.dll")
-        if not os.path.exists(artifact):
-            log(f"machine {m['id']}: artifact missing: {artifact}")
+        parts = read_parts(want, p["attributes"].get("patched_md5"))
+        if parts is None:
+            log(f"machine {m['id']}: patch {p['id']} has an unusable artifact set — skipped")
             continue
-        if md5_of(artifact) != want:
-            log(f"ABORT: artifact {artifact} does not match patched_md5 {want}")
+        state, why = parts_present(parts)
+        if state == "corrupt":
+            log(f"ABORT: {why}")
             return
+        if state == "missing":
+            log(f"machine {m['id']}: {why}")
+            continue
 
         try:
-            state, msg = install(m, p, artifact, args.dry_run, args.force)
+            state, msg = install(m, p, parts, args.dry_run, args.force)
         except Exception as e:
             # One machine must never take the sweep down. Treated as a skip, not a
             # failure: nothing was installed, so there is nothing to abort the run over.

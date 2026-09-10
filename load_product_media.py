@@ -101,7 +101,16 @@ def slug(name):
 
 
 def frame_num(name, fallback_idx):
-    m = re.search(r"_(\d+)\.(png|jpg|jpeg)$", name or "", re.I)
+    """Frame index from a source filename, zero-padded to 2.
+
+    Either separator: most frames are "<key>_splash_01.png" but a few came in as
+    "pump-splash-01.png", and the source name is discarded anyway — collect() rewrites
+    every frame to "<key>_splash_NN.png" — so the only thing wanted here is the number.
+    Anchored at the end, so relaxing the separator cannot re-read a name that already
+    parsed. The positional fallback is a last resort: it numbers frames by API order,
+    which is not guaranteed to be frame order.
+    """
+    m = re.search(r"[-_](\d+)\.(png|jpg|jpeg)$", name or "", re.I)
     return f"{int(m.group(1)):02d}" if m else f"{fallback_idx:02d}"
 
 
@@ -136,24 +145,45 @@ def taste_media_key(p):
 
 
 def cup_key(cup):
+    """Folder name for a cup under Media/Cups/ — must match cupKey() in the Strapi
+    machine controller, which puts the same string into planogram sportPit.name.
+
+    The cup's OWN image decides the key. This used to read the splash frame prefix
+    first, which was reasonable while every cup had its own animation named after it
+    (bcaa_splash_01.png). It stopped being true once the shared "Color ..." splashes
+    arrived: all of them are cut from one source, every frame is called
+    sport-water_splash_NN.png, and 93 of the 95 cups therefore collapsed onto the single
+    key "sport-water" — every cup rendering as the same picture no matter what the client
+    picked. The rule was self-defeating anyway, since collect() renames the frames to
+    <key>_splash_NN.png on the way out and never uses the source names again.
+
+    media_key is the explicit override, same escape hatch products already have: set it
+    when the uploaded filename cannot be the folder name.
+    """
     if not cup:
         return None
+    explicit = (cup.get("media_key") or "").strip()
+    if explicit and VALID_KEY.match(explicit):
+        return explicit
+    img = unwrap(cup.get("image"))
+    if img and img.get("name"):
+        k = re.sub(r"^cup-", "", stem(img["name"]))
+        if VALID_KEY.match(k):
+            return k
     ds = unwrap(cup.get("default_splash"))
     frames = unwrap(ds.get("images")) if ds else None
     if frames:
         m = re.match(r"^(.+?)_splash_\d+", frames[0]["name"], re.I)
         if m and VALID_KEY.match(m.group(1)):
             return m.group(1)
-    img = unwrap(cup.get("image"))
-    if img and img.get("name"):
-        k = re.sub(r"^cup-", "", stem(img["name"]))
-        if VALID_KEY.match(k):
-            return k
     return slug(cup.get("name"))
 
 
 LINE_POPULATE = urllib.parse.quote(
-    "populate[cup][populate][image]=true&populate[cup][populate][default_splash][populate][images]=true"
+    # product-line has "cups" (oneToMany), never "cup". Asking for the singular name
+    # returned nothing and Strapi does not complain about an unknown populate key, so
+    # cup art was silently never staged for anyone — see collect().
+    "populate[cups][populate][image]=true&populate[cups][populate][default_splash][populate][images]=true"
     "&populate[custom_splash][populate][images]=true"
     "&populate[brands][populate][logo]=true"
     "&populate[products][populate][taste][populate][main]=true"
@@ -162,6 +192,11 @@ LINE_POPULATE = urllib.parse.quote(
     "&populate[products][populate][custom_splash][populate][images]=true"
     "&populate[products][populate][custom_circle][populate][images]=true"
     "&populate[products][populate][custom_main]=true"
+    # A product may carry its OWN cup, which the planogram now prefers over the line's
+    # (machine.js: `p.cup || line.cups[0]`). Without this the folder for that cup is never
+    # staged and the kiosk asks for artwork that was never delivered — a blank tile.
+    "&populate[products][populate][cup][populate][image]=true"
+    "&populate[products][populate][cup][populate][default_splash][populate][images]=true"
     # The catalog's company block is built from the PRODUCT's brand, not the line's
     # brands[] — line 9 ('Whey Protein') carries no brands at all, yet serves company
     # 'mc'. Without this the logo is never staged and the kiosk shows a blank brand tile.
@@ -278,6 +313,7 @@ def collect(lines):
     """-> (items [(rel_path, url)], skips [(label, reason)])"""
     items, skips = [], []
     seen = set()
+    cup_keys = {}   # key -> cup name, to catch two cups claiming one folder
 
     def add(rel, url):
         if rel not in seen:
@@ -295,23 +331,54 @@ def collect(lines):
                 add(*it)
             else:
                 skips.append((f"brand '{b.get('name')}'", "no usable logo filename"))
-        cup = unwrap(line.get("cup"))
-        ck = cup_key(cup)
-        if cup and ck and VALID_KEY.match(ck):
-            img = unwrap(cup.get("image"))
-            if img:
-                add(f"Cups/{ck}/cup-{ck}.png", img["url"])
-            # Cup splash frames: the line's own custom_splash overrides the cup's
-            # default_splash. Frames go into the cup folder keyed by the CUP key (what
-            # the app looks up via Cup.mediaKey), regardless of the source frame names.
-            line_spl = unwrap(line.get("custom_splash"))
-            line_spl_imgs = unwrap(line_spl.get("images")) if line_spl else None
-            ds = unwrap(cup.get("default_splash"))
-            splash_imgs = line_spl_imgs or (unwrap(ds.get("images")) if ds else None) or []
-            for i, f in enumerate(splash_imgs, 1):
-                add(f"Cups/{ck}/{ck}_splash/{ck}_splash_{frame_num(f['name'], i)}.png", f["url"])
-        elif cup:
-            skips.append((f"cup '{cup.get('name')}' (line '{line.get('name')}')", "no clean cup key"))
+        # PATCH 25. Every cup of the line, not just [0]. A client line used to hold exactly
+        # one cup and only that one was pushed; with several cups the kiosk now draws a tile
+        # per cup, so a cup whose folder never arrived would show up as a blank tile. cups[0]
+        # is still what an unpatched machine asks for, and it is still first here.
+        cups = list(unwrap(line.get("cups")) or [])
+        # Each product's own cup joins the set: the planogram serves `p.cup or line.cups[0]`,
+        # so whichever one wins has to be on the machine. Deduped by id, line cups first, so
+        # cups[0] — what an unpatched machine shows — keeps its place.
+        seen_cup_ids = set(c.get("id") for c in cups if c)
+        for _p in unwrap(line.get("products")) or []:
+            if _p.get("isActive") is False:
+                continue
+            own_cup = unwrap(_p.get("cup"))
+            if own_cup and own_cup.get("id") not in seen_cup_ids:
+                seen_cup_ids.add(own_cup.get("id"))
+                cups.append(own_cup)
+        if not cups:
+            # Not cosmetic: the kiosk draws whatever cup the planogram names, and with no
+            # cup on the line that is cupKey(null) = "default". Worth seeing in the report.
+            skips.append((f"line '{line.get('name')}'", "no cup assigned"))
+        for cup in cups:
+            ck = cup_key(cup)
+            if cup and ck and VALID_KEY.match(ck):
+                # Two cups landing on one folder means the second silently wears the first
+                # one's picture. Nothing downstream can detect that, so say it here.
+                if cup_keys.setdefault(ck, cup.get("name")) != cup.get("name"):
+                    skips.append((f"cup '{cup.get('name')}' (line '{line.get('name')}')",
+                                  f"key '{ck}' already taken by cup '{cup_keys[ck]}' — "
+                                  f"rename the image file or set media_key"))
+                img = unwrap(cup.get("image"))
+                if img:
+                    add(f"Cups/{ck}/cup-{ck}.png", img["url"])
+                # Cup splash frames: the line's own custom_splash overrides the cup's
+                # default_splash. Frames go into the cup folder keyed by the CUP key (what
+                # the app looks up via Cup.mediaKey), regardless of the source frame names.
+                # PATCH 25. The line-level override is a SINGLE animation, so on a line with
+                # several cups it would paint the same splash into every cup folder and erase
+                # the very difference the extra tiles exist to show. With more than one cup
+                # each cup keeps its own default_splash; with one cup nothing changes.
+                line_spl = unwrap(line.get("custom_splash")) if len(cups) == 1 else None
+                line_spl_imgs = unwrap(line_spl.get("images")) if line_spl else None
+                ds = unwrap(cup.get("default_splash"))
+                splash_imgs = line_spl_imgs or (unwrap(ds.get("images")) if ds else None) or []
+                for i, f in enumerate(splash_imgs, 1):
+                    add(f"Cups/{ck}/{ck}_splash/{ck}_splash_{frame_num(f['name'], i)}.png", f["url"])
+            elif cup:
+                skips.append((f"cup '{cup.get('name')}' (line '{line.get('name')}')",
+                              "no clean cup key — image filename is unusable and media_key is unset"))
 
         for p in unwrap(line.get("products")) or []:
             if p.get("isActive") is False:

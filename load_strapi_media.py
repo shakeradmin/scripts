@@ -65,11 +65,12 @@ def strapi_login(identifier, password):
         return json.load(r)["jwt"]
 
 
-def all_entries(collection, token, populate, limit=None):
-    """Yield every entry across pages."""
+def all_entries(collection, token, query, limit=None):
+    """Yield every entry across pages. `query` is a full query fragment, e.g.
+    "populate=logo" or "populate[image]=true&populate[default_splash][populate][images]=true"."""
     page, size, seen = 1, 100, 0
     while True:
-        d = api(f"/api/{collection}?populate={populate}"
+        d = api(f"/api/{collection}?{query}"
                 f"&pagination[page]={page}&pagination[pageSize]={size}", token)
         for e in d.get("data", []):
             yield e
@@ -124,8 +125,14 @@ def media_list(attr_field):
 
 
 def frame_num(name):
-    """Trailing _NN before .png, zero-padded to 2. None if absent."""
-    m = re.search(r"_(\d+)\.png$", name, re.I)
+    """Trailing _NN or -NN before .png, zero-padded to 2. None if absent.
+
+    Both separators: the "Pump" splash shipped as pump-splash-01.png and its 20 frames
+    were dropped outright, while every other frame uses "_". The source name is discarded
+    on the way out — frames are rewritten as <key>_splash_NN.png — so only the number is
+    wanted. Anchored at the end, so this cannot change a name that already parsed.
+    """
+    m = re.search(r"[-_](\d+)\.png$", name, re.I)
     return f"{int(m.group(1)):02d}" if m else None
 
 
@@ -181,18 +188,32 @@ def target_paths(collection, entry):
             items.append((f"Tastes/{key}/{key}_splash/taste-{key}_{nn}.png", m["url"]))
 
     elif collection == "cups":
-        splash = media_list(a.get("splash"))
-        # cup key = prefix of "<key>_splash_NN.png"; reject anything else (e.g. taste-* placeholders)
-        key = ""
-        for m in splash:
-            mm = re.match(r"^(.+?)_splash_\d+\.png$", m["name"], re.I)
-            if mm and VALID_KEY.match(mm.group(1)):
-                key = mm.group(1)
-                break
+        # The relation is default_splash; this read "splash", which the cup content type
+        # has never had. media_list(None) is empty, key stays "", and the guard below only
+        # logged a skip when frames existed — so this branch quietly produced nothing at
+        # all, for every cup, every run.
+        ds = ((a.get("default_splash") or {}).get("data") or {}).get("attributes") or {}
+        splash = media_list(ds.get("images"))
+        main = media_list(a.get("image"))
+        # Key from the cup's OWN image, not from the splash frame prefix: the shared
+        # "Color ..." splashes are all cut from one animation whose frames are called
+        # sport-water_splash_NN.png, which collapsed every cup onto one folder. Same rule
+        # and same order as cup_key() in load_product_media.py.
+        key = (a.get("media_key") or "").strip()
         if not VALID_KEY.match(key or ""):
-            if splash:
-                skips.append((f"cup '{a.get('name')}'", f"frames not <key>_splash_NN (e.g. {splash[0]['name']!r})"))
+            key = re.sub(r"^cup-", "", clean_stem(main[0]["name"])) if main else ""
+        if not VALID_KEY.match(key or ""):
+            for m in splash:
+                mm = re.match(r"^(.+?)_splash_\d+\.png$", m["name"], re.I)
+                if mm and VALID_KEY.match(mm.group(1)):
+                    key = mm.group(1)
+                    break
+        if not VALID_KEY.match(key or ""):
+            skips.append((f"cup '{a.get('name')}'",
+                          f"no clean key (image {main[0]['name'] if main else None!r}) — set media_key"))
             return items, skips
+        for m in main:  # cup main is ShakerView's Cups/<key>/cup-<key>.png
+            items.append((f"Cups/{key}/cup-{key}.png", m["url"]))
         for m in splash:
             nn = frame_num(m["name"])
             if nn is None:
@@ -237,7 +258,10 @@ def main():
     token = strapi_login(ident, pw)
     print(f"Strapi auth OK as {ident}")
 
-    fields = {"brands": "logo", "tastes": "*", "cups": "splash"}
+    # Full query fragments, not bare populate values: cups need a tree, because the cup's
+    # own image and the frames under default_splash are at different depths.
+    fields = {"brands": "populate=logo", "tastes": "populate=*",
+              "cups": "populate[image]=true&populate[default_splash][populate][images]=true"}
     collections = [args.only] if args.only else ["brands", "tastes", "cups"]
 
     # Match brand logos to the machine's existing CompanyLogos filenames (fixes lock-in vs lock_in).
@@ -261,6 +285,20 @@ def main():
                 tasks.append((coll, os.path.join(stage, "Media", rel), url))
         counts[coll] = [n_ent, sum(1 for t in tasks if t[0] == coll)]
         print(f"[{coll}] {n_ent} entries -> {counts[coll][1]} media files")
+
+    # One destination, one download. Two entries can legitimately claim the same path
+    # (duplicate cup records such as "Bcaa"/"bcaa" resolve to one key), and letting both
+    # run meant two workers writing the same .part file — the loser died on os.replace and
+    # took the whole run with it. First claim wins; the duplicate is reported, not fatal.
+    deduped, claimed = [], {}
+    for coll, dest, url in tasks:
+        if dest in claimed:
+            if claimed[dest] != url:
+                all_skips.append((os.path.relpath(dest, stage), "two entries claim this path — second ignored"))
+            continue
+        claimed[dest] = url
+        deduped.append((coll, dest, url))
+    tasks = deduped
 
     # Download concurrently (TLS handshake per file dominates; parallelism is the whole win).
     print(f"\nDownloading {len(tasks)} files with {args.workers} workers (resume=on)…")

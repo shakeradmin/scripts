@@ -244,10 +244,18 @@ def machines(token, only=None):
     return out
 
 
-def pick_firmware(firmwares, machine):
+def pick_firmware(firmwares, machine, p=None):
     """The stable image whose machine_types covers this machine, newest first. Records with no
     machine_types are SKIPPED, not treated as universal — an untagged S image reaching a Touch 2
-    is exactly the mistake the tag exists to prevent."""
+    is exactly the mistake the tag exists to prevent.
+
+    `p` (a probe result) is what separates the two Touch 2 records that share a version and
+    differ only in image: MDRV_TOUCH.hex and MDRV_TOUCH_FWP.hex both ship 260430-01, and the
+    machine's own WaterDivider decides which one its app opens. Without it, max()-by-version
+    picks whichever came back first from Strapi and the fit check downstream then blocks the
+    machine outright. Records that do not fit are dropped here; if that leaves nothing, the
+    best-by-version is returned anyway so image_mismatch() can say why it was refused.
+    """
     mt = (machine.get("machine_type") or {}).get("data")
     mt_id = mt["id"] if mt else None
     hits = []
@@ -257,7 +265,14 @@ def pick_firmware(firmwares, machine):
             continue
         if mt_id in [t["id"] for t in types] and vkey(f.get("version")):
             hits.append(f)
-    return max(hits, key=lambda f: vkey(f["version"])) if hits else None
+    if not hits:
+        return None
+    if p:
+        fitting = [f for f in hits
+                   if not image_mismatch(f.get("hex_filename") or "", p)]
+        if fitting:
+            hits = fitting
+    return max(hits, key=lambda f: vkey(f["version"]))
 
 
 def image_path(fw, token):
@@ -307,12 +322,15 @@ UPS=$(ps -o etimes= -p "$(pgrep -f '^/home/shaker/ShakerView2.0Linux/ShakerView2
 H=$(md5sum $D/*.hex 2>/dev/null | head -1 | awk '{print $1}')
 N=$(ls $D/*.hex 2>/dev/null | head -1 | xargs -r basename)
 T=$(grep -o '"IsTouch2": *[a-z]*' $C 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
+# WaterDivider decides WHICH Touch 2 image the app opens (FWP vs plain), so it is as
+# load-bearing as IsTouch2 -- see image_mismatch(). Empty when pwm_settings.json is absent.
+WD=$(grep -o '"WaterDivider": *[0-9]*' $D/Config/pwm_settings.json 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
 W=$(grep -ac FirmwareFlashWatchdog $D/Managed/CommonCode.dll 2>/dev/null || echo 0)
 A=$(test -f $D/Config/fleet_flash_armed.json && echo armed || (test -f $D/Config/fleet_flash_armed.consumed.json && echo consumed || echo none))
 F=$(grep -o '"NeedToUpdateFirmware": *[a-z]*' $D/Config/updater_settings.json 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
 P=$(grep -ao 'CurrentScreen = [A-Za-z]*' $HOME/.config/unity3d/ShakerTechnology/ShakerView2.0/Player.log 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
 R=$(pgrep -f '^/home/shaker/ShakerView2.0Linux/ShakerView2.0.x86_64$' | head -1)
-echo "$S|$M|$V|$H|$N|$T|$W|$A|$F|$P|$R|${VAGE:-}|${UPS:-}"
+echo "$S|$M|$V|$H|$N|$T|$W|$A|$F|$P|$R|${VAGE:-}|${UPS:-}|${WD:-}"
 """ % {"d": SV_DATA}
 
 
@@ -323,13 +341,15 @@ def probe(machine):
         return None
     if out.strip() == "NO_SHAKERVIEW":
         return {"no_sv": True}
-    f = (out.split("|") + [""] * 13)[:13]
+    f = (out.split("|") + [""] * 14)[:14]
     (serial, is_s, raw, staged_md5, staged_name, is_touch2, watchdog, armed, need_flag,
-     screen, pid, ver_age, app_uptime) = f
+     screen, pid, ver_age, app_uptime, water_divider) = f
     return {"no_sv": False, "serial": serial, "is_s": is_s == "true",
             "raw": raw, "version": decode_version(raw),
             "staged_md5": staged_md5, "staged_name": staged_name,
             "is_touch2": is_touch2 == "true",
+            # None when pwm_settings.json is missing -- "unknown", not "not 1".
+            "water_divider": int(water_divider) if water_divider.strip().isdigit() else None,
             # The binary's own answer to "can this machine survive a failed flash", which is
             # what actually matters -- Strapi's patch relation drifts (hand-patched machines,
             # machines bootstrapped after the fact) and would let an unattended flash onto a
@@ -440,10 +460,25 @@ def arm_flash(machine, fw, filename, dry_run):
     return True, out.strip()
 
 
-# What ControllerFirmwareTestLoader.Start() will actually open, per IsTouch2. Names come from
+# What ControllerFirmwareTestLoader.Start() will actually open. Names come from
 # Settings.ControllerHexFilePath / ControllerHexFileTouch2 / ControllerHexFileTouch2FWP.
+#
+#   IsTouch2 == false                          -> Shkr_M_Con_V3.hex
+#   IsTouch2 && PWMSettings.WaterDivider == 1   -> MDRV_TOUCH_FWP.hex
+#   IsTouch2 && WaterDivider != 1               -> MDRV_TOUCH.hex
 S_IMAGE = "shkr_m_con"
 TOUCH2_IMAGES = ("mdrv_touch",)
+TOUCH2_FWP = "mdrv_touch_fwp"
+
+
+def expected_image(p):
+    """The exact filename this machine's app would open, or None when it cannot be determined."""
+    if not p.get("is_touch2"):
+        return "Shkr_M_Con_V3.hex"
+    wd = p.get("water_divider")
+    if wd is None:
+        return None
+    return "MDRV_TOUCH_FWP.hex" if wd == 1 else "MDRV_TOUCH.hex"
 
 
 def image_mismatch(filename, p):
@@ -461,11 +496,26 @@ def image_mismatch(filename, p):
     name = (filename or "").lower()
     is_touch2 = bool(p.get("is_touch2"))
     if is_touch2 and not any(t in name for t in TOUCH2_IMAGES):
-        return (f"machine has IsTouch2=true and loads MDRV_TOUCH.hex, but this record ships "
+        return (f"machine has IsTouch2=true and loads MDRV_TOUCH*.hex, but this record ships "
                 f"{filename} — refusing, it would never be flashed and only litters _Data/")
     if not is_touch2 and any(t in name for t in TOUCH2_IMAGES):
         return (f"machine has IsTouch2=false and loads {S_IMAGE.upper()}*.hex, but this record "
                 f"ships {filename} — refusing")
+    # Touch 2 has TWO images for the same release and the app picks between them by
+    # PWMSettings.WaterDivider, not by anything an operator tags. Getting this wrong is not a
+    # harmless no-op: on 2026-08-07 machine 110 (WaterDivider=1) was staged MDRV_TOUCH.hex, so
+    # EnterTheProgrammingMode() found IsFileExist == false, logged "Hexfile doesn't Exist!" and
+    # left the Unity main thread wedged for the 300s it took FirmwareFlashWatchdog to kill it —
+    # a restarted kiosk and a burned flash attempt for a file the app was never going to open.
+    want = expected_image(p)
+    if is_touch2 and want is None:
+        return ("machine has IsTouch2=true but no readable PWMSettings.WaterDivider — cannot tell "
+                "whether it opens MDRV_TOUCH.hex or MDRV_TOUCH_FWP.hex; refusing to guess")
+    if is_touch2 and name != want.lower():
+        wd = p.get("water_divider")
+        return (f"machine has IsTouch2=true and WaterDivider={wd}, so its app opens {want}, "
+                f"but this record ships {filename} — refusing, the wedge it causes costs a "
+                f"kiosk restart")
     return None
 
 
@@ -565,7 +615,7 @@ def sweep_one(m, firmwares, token, dry_run, report_only, budget):
     cur = p["version"]
     status = {"at": now, "read": cur or "unknown", "raw": p["raw"] or None}
 
-    fw = pick_firmware(firmwares, m)
+    fw = pick_firmware(firmwares, m, p)
     if not fw:
         status["action"] = "no stable firmware for this machine type"
         return name, f"{cur or '?'} — nothing to roll out", status
