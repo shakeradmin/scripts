@@ -824,6 +824,43 @@ def readiness_summary(report):
     }
 
 
+_TAILNET_CACHE = None
+
+
+def tailnet_online():
+    """{tailscale_ip: bool} — is each node up, as the tailnet itself sees it.
+
+    Why this is here at all: "offline" on the dashboard used to mean "SSH from THIS
+    workstation failed", which is a statement about our access, not about the kiosk. The two
+    stopped agreeing and nobody noticed for weeks. Measured 2026-09-10: 19 nodes alive on the
+    tailnet, 21 genuinely powered off, and only 10 answering SSH — so nine working kiosks were
+    being shown to the operator as dead.
+
+    The tailnet is the right witness because it is the machine that reports in: tailscaled
+    on the kiosk holds the connection, so Online here means that box is powered, networked
+    and running. It costs one local call per sweep, not one per machine, and it keeps working
+    when our SSH key, the authorized_keys on the box, or the tailnet SSH ACL are wrong —
+    which is exactly when the old signal lied.
+
+    Cached for the life of the process: a sweep is short and this is a local query.
+    """
+    global _TAILNET_CACHE
+    if _TAILNET_CACHE is not None:
+        return _TAILNET_CACHE
+    _TAILNET_CACHE = {}
+    try:
+        r = subprocess.run(["tailscale", "status", "--json"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            peers = (json.loads(r.stdout) or {}).get("Peer") or {}
+            for peer in peers.values():
+                for ip in peer.get("TailscaleIPs") or []:
+                    _TAILNET_CACHE[ip] = bool(peer.get("Online"))
+    except Exception as exc:
+        log(f"tailnet status unavailable ({exc}) — falling back to ssh as the only liveness signal")
+    return _TAILNET_CACHE
+
+
 def sweep_machine(m, token, dry_run=False, verbose=False):
     mdir = os.path.join(STATE_ROOT, str(m["id"]))
     os.makedirs(mdir, exist_ok=True)
@@ -833,15 +870,26 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
 
     # 1) heartbeat
     if not target:
-        status.update(ssh_ok=False, sweep="no tailscale_ip")
+        status.update(ssh_ok=False, sweep="no tailscale_ip", online=False, online_source=None)
         return status, ["no tailscale_ip in machine record"]
     try:
         status.update(heartbeat(target))
     except subprocess.TimeoutExpired:
         status.update(ssh_ok=False)
     if not status.get("ssh_ok"):
+        # SSH failed. That says we cannot INSPECT the machine; it does not say the machine is
+        # dead. Ask the tailnet, which hears from the box itself, before calling it offline.
+        # `sweep` and `ssh_ok` keep their old meaning so fleetpatch/fleetfirmware — which
+        # genuinely need a shell — are unaffected; `online` is the field to render a badge from.
+        alive = tailnet_online().get(m["ip"])
         status["sweep"] = "unreachable"
+        if alive:
+            status.update(online=True, online_source="tailnet")
+            return status, ["unreachable over ssh, but the node is up on the tailnet — "
+                            "the kiosk is alive and only our access is broken"]
+        status.update(online=False, online_source=None)
         return status, ["unreachable"]
+    status.update(online=True, online_source="ssh")
     if status.get("app_pid") is None:
         # Our own media restart kills the kiosk and lets AppManager relaunch it, which takes
         # ~20 s. A sweep landing in that gap used to write "no process" straight into
@@ -1077,6 +1125,8 @@ def main():
         low = [str(c["position"]) for c in (h.get("containers") or []) if c.get("runs_out")]
         swept.add(m["id"])
         line = (f"machine {m['id']} ({m['serial']}): sweep={status.get('sweep')} "
+                f"online={'yes' if status.get('online') else 'no'}"
+                f"{'/' + status['online_source'] if status.get('online_source') else ''} "
                 f"app={'up' if status.get('app_pid') else 'DOWN'} "
                 f"ws={status.get('telemetry_ws')} cat={status.get('catalog_md5')}"
                 + (f" health=cups:{(h.get('cups') or {}).get('current')}"

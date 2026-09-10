@@ -172,6 +172,30 @@ if command -v tailscale >/dev/null 2>&1; then
     else
       fail identity.tailscale "Tailscale not connected — fleet tooling (fleetpulse/fleetpatch/fleetfirmware) cannot reach this machine at all"
     fi
+
+    # A unit must ship with TWO independent ways in, because each one has failed alone:
+    #   * Tailscale SSH authorises by tailnet identity, so no key can go stale — but the
+    #     tailnet POLICY can still refuse the shaker user (machine 65 "half", 2026-09-10),
+    #     and that is invisible from the box itself.
+    #   * the ops pubkey in authorized_keys survives a tailnet/ACL problem — but it is copied
+    #     once at provisioning and goes stale the moment the workstation key is regenerated
+    #     (2026-09-09), which is how machines ended up alive but unreachable for weeks.
+    # Neither is sufficient. Ship with both or do not ship.
+    TSSSH="$(tailscale debug prefs 2>/dev/null | grep -o '"RunSSH": [a-z]*' | awk '{print $2}')"
+    if [ "$TSSSH" = "true" ]; then
+      ok access.tailscale_ssh "Tailscale SSH ON — access does not depend on any key"
+    else
+      fail access.tailscale_ssh "Tailscale SSH OFF — the only way in is the ops key, which goes stale on the next workstation re-key. Fix: sudo tailscale set --ssh --accept-risk=lose-ssh"
+    fi
+
+    AK="$HOME/.ssh/authorized_keys"
+    if [ -z "${OPS_SSH_PUBKEY:-}" ]; then
+      warn access.ops_key "OPS_SSH_PUBKEY not supplied to this run — cannot verify the fallback key is installed"
+    elif [ -f "$AK" ] && grep -qxF "$OPS_SSH_PUBKEY" "$AK"; then
+      ok access.ops_key "ops pubkey present in authorized_keys — fallback way in survives a tailnet/ACL problem"
+    else
+      fail access.ops_key "ops pubkey MISSING from authorized_keys — no fallback if Tailscale SSH or the tailnet policy breaks"
+    fi
   fi
 else
   info identity.tailscale "tailscale not installed"

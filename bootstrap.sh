@@ -2251,8 +2251,19 @@ run_readiness_gate() {
 
   # stdout is the JSON report; the human-readable lines come out on stderr and land in the
   # bootstrap log through the tee at the top of this script.
-  bash "$script" local --mode=unit --json >"$jf"
-  local rc=$?
+  # Two defects fixed together here.
+  #
+  # 1. OPS_SSH_PUBKEY is exported so the gate's access.ops_key check has something to compare
+  #    against. Without it the check can only warn, and a machine could ship with no working
+  #    fallback way in — which is how the fleet ended up alive but unreachable after the
+  #    workstation key was regenerated on 2026-09-09.
+  #
+  # 2. `set -e` used to kill this function right here: diagnose.sh exits 1 on REVIEW and 2 on
+  #    DO_NOT_SHIP, so on any non-SHIP verdict `local rc=$?` never ran and neither did
+  #    anything below it — including start_kiosk_app. The run printed BOOTSTRAP FAILED with a
+  #    kiosk left down, on a machine that had provisioned perfectly. Capture the code instead.
+  local rc=0
+  OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}" bash "$script" local --mode=unit --json >"$jf" || rc=$?
   [ -n "$tmp" ] && rm -f "$tmp"
   chown "$SSH_LOGIN_USER":"$SSH_LOGIN_USER" "$jf" 2>/dev/null || true
 
