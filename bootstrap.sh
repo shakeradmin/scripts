@@ -62,9 +62,12 @@ BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
 START_APP_AFTER_BOOTSTRAP="${START_APP_AFTER_BOOTSTRAP:-true}"
 MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
 # FleetCatalog (Config/fleet.json): the machine PULLS its catalog + planogram from Strapi.
-# Tailscale-direct on purpose — admin.ishaker.xyz sits behind Cloudflare, which 403s the
-# app's user-agent (error 1010). CATALOG_TOKEN is the shared bearer the endpoints check.
-FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
+# Since 2026-09-15 production Strapi runs on the DO VPS and admin.ishaker.xyz is a DNS-only
+# A record (no Cloudflare proxy, so no error 1010 for the app's user-agent). Machines talk to
+# it directly — the old Tailscale-direct http://100.101.29.104:1338 is now only a relay on the
+# workstation, kept for machines not yet migrated. Mono TLS is fine: the vendor RequestManager
+# disables certificate validation globally. CATALOG_TOKEN is the shared bearer the endpoints check.
+FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-https://admin.ishaker.xyz}"
 FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
 FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
 OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}"
@@ -356,7 +359,7 @@ load_env() {
   MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
   # MUST be re-defaulted here, not only at the top of the script: the top-level assignment
   # runs before .env is sourced, so CATALOG_TOKEN placed in .env would never reach it.
-  FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-http://100.101.29.104:1338}"
+  FLEET_CATALOG_URL="${FLEET_CATALOG_URL:-https://admin.ishaker.xyz}"
   FLEET_CATALOG_TOKEN="${FLEET_CATALOG_TOKEN:-${CATALOG_TOKEN:-}}"
   FLEET_REFRESH_MINUTES="${FLEET_REFRESH_MINUTES:-5}"
   OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}"
