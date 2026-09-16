@@ -2266,7 +2266,9 @@ run_readiness_gate() {
   #    anything below it — including start_kiosk_app. The run printed BOOTSTRAP FAILED with a
   #    kiosk left down, on a machine that had provisioned perfectly. Capture the code instead.
   local rc=0
-  OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}" bash "$script" local --mode=unit --json >"$jf" || rc=$?
+  # KIOSK_EXPECTED_DOWN: the kiosk is stopped for the whole run and start_kiosk_app comes
+  # after the summary, so without this flag the gate always failed kiosk.shakerview.
+  OPS_SSH_PUBKEY="${OPS_SSH_PUBKEY:-}" KIOSK_EXPECTED_DOWN=1 bash "$script" local --mode=unit --json >"$jf" || rc=$?
   [ -n "$tmp" ] && rm -f "$tmp"
   chown "$SSH_LOGIN_USER":"$SSH_LOGIN_USER" "$jf" 2>/dev/null || true
 

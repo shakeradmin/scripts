@@ -188,7 +188,10 @@ if command -v tailscale >/dev/null 2>&1; then
       fail access.tailscale_ssh "Tailscale SSH OFF — the only way in is the ops key, which goes stale on the next workstation re-key. Fix: sudo tailscale set --ssh --accept-risk=lose-ssh"
     fi
 
-    AK="$HOME/.ssh/authorized_keys"
+    # The kiosk user's file, never $HOME: bootstrap runs this gate as root, and $HOME is
+    # then /root, which has no authorized_keys at all — every bootstrap run on 2026-09-16
+    # reported the ops key MISSING while it was sitting in /home/shaker (false DO_NOT_SHIP).
+    AK="/home/shaker/.ssh/authorized_keys"
     if [ -z "${OPS_SSH_PUBKEY:-}" ]; then
       warn access.ops_key "OPS_SSH_PUBKEY not supplied to this run — cannot verify the fallback key is installed"
     elif [ -f "$AK" ] && grep -qxF "$OPS_SSH_PUBKEY" "$AK"; then
@@ -284,11 +287,22 @@ hdr "3. KIOSK RUNTIME"
 # ---------------------------------------------------------------------------
 SV=$(pgrep -cf "ShakerView2.0.x86_64\$" 2>/dev/null)
 AM=$(pgrep -af "/AppManager\$" 2>/dev/null | grep -vc "sh -c")
+# bootstrap stops the kiosk for the whole run and only relaunches AppManager AFTER this gate
+# (so the operator can read the summary before ShakerView takes the screen). It says so with
+# KIOSK_EXPECTED_DOWN=1; a stopped kiosk is then the expected state, not a failure. Anything
+# still running in that window IS a problem (a stray relaunch the run did not control).
+if [ "${KIOSK_EXPECTED_DOWN:-0}" = "1" ]; then
+  [ "${SV:-0}" = "0" ] && info kiosk.shakerview "ShakerView stopped for provisioning — bootstrap relaunches it after this gate" \
+                       || fail kiosk.shakerview "ShakerView running ($SV) while bootstrap expects it stopped — stray relaunch"
+  [ "${AM:-0}" = "0" ] && info kiosk.appmanager "AppManager stopped for provisioning (relaunched after this gate)" \
+                       || warn kiosk.appmanager "AppManager count=$AM while bootstrap expects 0 — stray relaunch"
+else
 [ "${SV:-0}" = "1" ] && ok kiosk.shakerview "ShakerView running (1 process)" \
   || { [ "${SV:-0}" = "0" ] && fail kiosk.shakerview "ShakerView NOT running — no kiosk at the client" \
                             || fail kiosk.shakerview "ShakerView duplicate processes: $SV"; }
 [ "${AM:-0}" = "1" ] && ok kiosk.appmanager "AppManager (1)" \
                      || warn kiosk.appmanager "AppManager count=$AM (1 expected; 2+ = duplicate relaunch loop)"
+fi
 grep -rqsE '^AutomaticLogin' /etc/gdm3/custom.conf /etc/gdm/custom.conf 2>/dev/null \
   && ok kiosk.autologin "GDM autologin configured" \
   || fail kiosk.autologin "GDM autologin not found — kiosk will not come up unattended after power-on"
@@ -454,7 +468,14 @@ except Exception: print(-1)" 2>/dev/null)"
         200) [ "${NCELL:-0}" -gt 0 ] && ok "fleet.$ep" "/$ep returns 200 with $NCELL cells for $SERIAL_HS" \
                                      || warn "fleet.$ep" "/$ep returns 200 but 0 cells — machine will show an empty screen at the client" ;;
         401|403) fail "fleet.$ep" "/$ep returns $CODE — fleet.json token is rejected (machine secret written where the shared CATALOG_TOKEN was needed?)" ;;
-        404) fail "fleet.$ep" "/$ep returns 404 — no Strapi machine record for serial '$SERIAL_HS'" ;;
+        404) # Strapi answers 404 for two different things: an unknown serial, and a known
+             # machine whose cells are not linked ("no catalog content for serial …"). The
+             # second is the normal state right after bootstrap — nothing assigned yet.
+             if grep -q "no catalog content\|no planogram content" /tmp/.dg.$ep 2>/dev/null; then
+               fail "fleet.$ep" "/$ep returns 404 'no content' — Strapi machine record exists but has no cells/assortment assigned; assign a client + preset (or products) in the portal before shipping"
+             else
+               fail "fleet.$ep" "/$ep returns 404 — no Strapi machine record for serial '$SERIAL_HS'"
+             fi ;;
         422) fail "fleet.$ep" "/$ep returns 422 — catalog data invalid (0-based cell positions / missing price)" ;;
         *)   warn "fleet.$ep" "/$ep unreachable (HTTP ${CODE:-000}) — Strapi not reachable from this machine right now" ;;
       esac
