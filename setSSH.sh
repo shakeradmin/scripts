@@ -16,4 +16,4 @@ if [ "$fetch_ok" -ne 1 ]; then
   exit 1
 fi
 
-sudo TS_AUTHKEY=tskey-auth-kmQmA96HCq11CNTRL-r6U4HRHMHPWYKy2TMFHkPW6sXWnPnTjF bash /tmp/setTailscale.sh
+sudo TS_AUTHKEY=tskey-auth-kkdgXemiSd11CNTRL-pV1dXFH7aXMnkfEw6kH8XMtvXR4FovQtZ bash /tmp/setTailscale.sh
