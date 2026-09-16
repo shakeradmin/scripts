@@ -794,8 +794,11 @@ EOF
 
   # Verify rather than assume. `snap get system refresh.hold` stays "none" after --hold and will
   # happily lie to you; `snap refresh --time` is the only authoritative check.
-  log "apt-daily.timer: $(systemctl is-enabled apt-daily.timer 2>&1)"
-  log "apt-daily-upgrade.timer: $(systemctl is-enabled apt-daily-upgrade.timer 2>&1)"
+  # `is-enabled` exits 1 for "masked" — the very state we just put the timers in. Under
+  # inherit_errexit that fired the ERR trap inside the $(...) and printed two full
+  # "ERROR: bootstrap failed" blocks into the log on every run, while the run went on.
+  log "apt-daily.timer: $(systemctl is-enabled apt-daily.timer 2>&1 || true)"
+  log "apt-daily-upgrade.timer: $(systemctl is-enabled apt-daily-upgrade.timer 2>&1 || true)"
   if command -v snap >/dev/null 2>&1; then
     local snap_hold
     snap_hold="$(snap refresh --time 2>/dev/null | awk '/^hold:/ {print $2}')"
@@ -2387,6 +2390,20 @@ main() {
 
   set_stage "waiting for the network"
   wait_for_online
+  # A .env left on the disk by an earlier bootstrap (or cloned with it) silently answers the
+  # identity questions below — the operator never sees a machine-type prompt and the box
+  # lands in whatever org/nickname that file was written for. Say so where they can see it.
+  if [ -n "${MACHINE_TYPE_ID:-}" ] || [ -n "${MACHINE_NICKNAME:-}" ] || [ -n "${MACHINE_SERIAL_NUMBER:-}" ] || [ "${MANAGE_ORG_ID:-2}" != "2" ]; then
+    {
+      echo ""
+      echo "NOTE: identity is preset by $ENV_FILE — no prompts for these:"
+      echo "      machine type id = ${MACHINE_TYPE_ID:-<will ask>}   nickname = ${MACHINE_NICKNAME:-<will ask>}"
+      echo "      serial          = ${MACHINE_SERIAL_NUMBER:-<will ask>}   manage org = ${MANAGE_ORG_ID:-2}"
+      echo "      Wrong machine? Ctrl-C now, delete or edit that .env, re-run."
+      echo ""
+    } >/dev/tty 2>/dev/null || true
+    log "identity preset by $ENV_FILE: type=${MACHINE_TYPE_ID:-} nickname=${MACHINE_NICKNAME:-} serial=${MACHINE_SERIAL_NUMBER:-} org=${MANAGE_ORG_ID:-2}"
+  fi
   set_stage "asking the operator for serial / nickname / machine type"
   local serial_number
   serial_number="$(prompt_for_serial_number)"
