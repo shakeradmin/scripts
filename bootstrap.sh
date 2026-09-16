@@ -655,30 +655,32 @@ prompt_for_serial_number() {
 
 # Short friendly label (Strapi machine.nickname) — purely for humans telling machines apart at a
 # glance in the dashboard; has no bearing on telemetry/Keycloak identity, unlike serial_number.
+# ALWAYS asked, even when MACHINE_NICKNAME is set: a .env cloned along with the disk once
+# answered this silently and a box was registered under another client's nickname
+# (26030132 as "fitfuel", 2026-09-16). A preset value is only the default offered.
 prompt_for_nickname() {
-  local nickname=""
+  local nickname="" default="${MACHINE_NICKNAME:-}"
 
-  if [ -n "$MACHINE_NICKNAME" ]; then
-    log "Using MACHINE_NICKNAME from environment"
-    printf "%s" "$MACHINE_NICKNAME"
-    return
-  fi
+  [ -n "$default" ] && log "nickname default from environment: $default (operator still asked)"
 
   while [ -z "$nickname" ]; do
-    nickname="$(read_tty "Enter machine nickname: " | xargs)"
+    if [ -n "$default" ]; then
+      nickname="$(read_tty "Enter machine nickname [$default]: " | xargs)"
+      [ -n "$nickname" ] || nickname="$default"
+    else
+      nickname="$(read_tty "Enter machine nickname: " | xargs)"
+    fi
   done
 
+  log "nickname confirmed by operator: $nickname"
   printf "%s" "$nickname"
 }
 
+# ALWAYS asked, for the same reason as the nickname: MACHINE_TYPE_ID is only the default.
 prompt_for_machine_type_id() {
-  local type_id=""
+  local type_id="" default="${MACHINE_TYPE_ID:-}"
 
-  if [ -n "${MACHINE_TYPE_ID:-}" ]; then
-    log "Using MACHINE_TYPE_ID from environment"
-    printf "%s" "$MACHINE_TYPE_ID"
-    return
-  fi
+  [ -n "$default" ] && log "machine type default from environment: $default (operator still asked)"
 
   log "Fetching machine types from Strapi..."
   local token types_json
@@ -701,9 +703,23 @@ else:
   echo "" >/dev/tty
 
   while [ -z "$type_id" ]; do
-    type_id="$(read_tty "Enter machine type ID: " | xargs)"
+    if [ -n "$default" ]; then
+      type_id="$(read_tty "Enter machine type ID [$default]: " | xargs)"
+      [ -n "$type_id" ] || type_id="$default"
+    else
+      type_id="$(read_tty "Enter machine type ID: " | xargs)"
+    fi
+    # Must be one of the ids just listed — a typo here silently makes a Touch a Shaker S.
+    if ! echo "$types_json" | MT="$type_id" python3 -c '
+import json, os, sys
+ids = {str(i["id"]) for i in json.load(sys.stdin).get("data", [])}
+sys.exit(0 if os.environ["MT"] in ids else 1)' 2>/dev/null; then
+      echo "  '$type_id' is not in the list above" >/dev/tty
+      type_id=""
+    fi
   done
 
+  log "machine type confirmed by operator: $type_id"
   printf "%s" "$type_id"
 }
 
@@ -2396,9 +2412,9 @@ main() {
   if [ -n "${MACHINE_TYPE_ID:-}" ] || [ -n "${MACHINE_NICKNAME:-}" ] || [ -n "${MACHINE_SERIAL_NUMBER:-}" ] || [ "${MANAGE_ORG_ID:-2}" != "2" ]; then
     {
       echo ""
-      echo "NOTE: identity is preset by $ENV_FILE — no prompts for these:"
-      echo "      machine type id = ${MACHINE_TYPE_ID:-<will ask>}   nickname = ${MACHINE_NICKNAME:-<will ask>}"
-      echo "      serial          = ${MACHINE_SERIAL_NUMBER:-<will ask>}   manage org = ${MANAGE_ORG_ID:-2}"
+      echo "NOTE: $ENV_FILE presets defaults for the prompts below (Enter accepts them):"
+      echo "      machine type id = ${MACHINE_TYPE_ID:-<none>}   nickname = ${MACHINE_NICKNAME:-<none>}"
+      echo "      serial          = ${MACHINE_SERIAL_NUMBER:-<none>}   manage org = ${MANAGE_ORG_ID:-2} (NOT prompted)"
       echo "      Wrong machine? Ctrl-C now, delete or edit that .env, re-run."
       echo ""
     } >/dev/tty 2>/dev/null || true
