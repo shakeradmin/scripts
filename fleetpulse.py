@@ -40,7 +40,7 @@ USAGE
   python3 fleetpulse.py --dry-run                                        # no writes
 """
 import argparse, base64, datetime, hashlib, importlib.util, json, os, re, shlex, subprocess, sys
-import time
+import threading, time
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -412,7 +412,16 @@ def health_only_pass(machines, token, dry_run=False):
         try:
             status = heartbeat(f"{m['user']}@{m['ip']}")
         except subprocess.TimeoutExpired:
-            return m, None
+            status = {}
+        if not status.get("ssh_ok") and not dry_run:
+            note = heal_access(m)
+            if note:
+                print(f"machine {m['id']} ({m['serial']}): {note}")
+            if note and note.startswith("ACCESS HEALED"):
+                try:
+                    status = heartbeat(f"{m['user']}@{m['ip']}")
+                except subprocess.TimeoutExpired:
+                    return m, None
         return (m, build_health(status)) if status.get("ssh_ok") else (m, None)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -824,6 +833,56 @@ def readiness_summary(report):
     }
 
 
+HEAL_STATE = os.path.join(STATE_ROOT, "access_heal.json")
+HEAL_EVERY = 3600          # one password attempt per machine per hour, not per 3-min sweep
+_HEAL_LOCK = threading.Lock()
+
+
+def heal_access(m):
+    """A machine that is up on the tailnet but refuses our SSH: turn Tailscale SSH on over the
+    PASSWORD channel. Returns a note string, or None when nothing was attempted.
+
+    Why this exists (2026-10-07): the workstation key ~/.ssh/id_ed25519 carries a passphrase
+    and cron has no ssh-agent, so key auth from here works on NO machine — authorized_keys
+    being right changes nothing (Peacock 95 had the current key and still refused). The only
+    working keyless path is Tailscale SSH, and enforce_tailscale_ssh() cannot switch it on for
+    a machine it cannot get into. Peacock, ankara, istanbul and bone sat like that for weeks
+    and never received the media library — white boxes instead of cups at a client.
+
+    Password auth is on fleet-wide (10-tailscale-hardening.conf), so it is the repair channel.
+    Manual-support machines never get here: select_machines() already dropped them.
+    """
+    if not SUDO_PASS or not m.get("ip") or not tailnet_online().get(m["ip"]):
+        return None
+    with _HEAL_LOCK:
+        try:
+            seen = json.load(open(HEAL_STATE))
+        except Exception:
+            seen = {}
+        if time.time() - seen.get(str(m["id"]), 0) < HEAL_EVERY:
+            return None
+        seen[str(m["id"])] = time.time()
+        with open(HEAL_STATE + ".tmp", "w") as f:
+            json.dump(seen, f)
+        os.replace(HEAL_STATE + ".tmp", HEAL_STATE)
+    target = f"{m['user']}@{m['ip']}"
+    try:
+        r = subprocess.run(["sshpass", "-e", "ssh", "-o", "ConnectTimeout=8",
+                            "-o", "StrictHostKeyChecking=accept-new",
+                            "-o", "PreferredAuthentications=password",
+                            "-o", "PubkeyAuthentication=no", target,
+                            "sudo -S -p '' tailscale set --ssh --accept-risk=lose-ssh"],
+                           input=SUDO_PASS + "\n", capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "SSHPASS": SUDO_PASS})
+    except subprocess.TimeoutExpired:
+        return "ACCESS HEAL: password channel timed out"
+    if r.returncode != 0:
+        return f"ACCESS HEAL FAILED: rc={r.returncode} {(r.stderr or '').strip()[:80]}"
+    rc, _ = ssh_run(target, "true", timeout=15)
+    return "ACCESS HEALED: Tailscale SSH enabled over password" if rc == 0 else \
+           "ACCESS HEAL: RunSSH set, but keyless ssh still refused"
+
+
 _TAILNET_CACHE = None
 
 
@@ -876,6 +935,15 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
         status.update(heartbeat(target))
     except subprocess.TimeoutExpired:
         status.update(ssh_ok=False)
+    healed = None
+    if not status.get("ssh_ok") and not dry_run:
+        healed = heal_access(m)
+        if healed and healed.startswith("ACCESS HEALED"):
+            try:
+                status.update(heartbeat(target))
+            except subprocess.TimeoutExpired:
+                status.update(ssh_ok=False)
+            notes.append(healed)
     if not status.get("ssh_ok"):
         # SSH failed. That says we cannot INSPECT the machine; it does not say the machine is
         # dead. Ask the tailnet, which hears from the box itself, before calling it offline.
@@ -886,7 +954,8 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
         if alive:
             status.update(online=True, online_source="tailnet")
             return status, ["unreachable over ssh, but the node is up on the tailnet — "
-                            "the kiosk is alive and only our access is broken"]
+                            "the kiosk is alive and only our access is broken"] + \
+                           ([healed] if healed else [])
         status.update(online=False, online_source=None)
         return status, ["unreachable"]
     status.update(online=True, online_source="ssh")
