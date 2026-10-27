@@ -135,7 +135,14 @@ def taste_media_key(p):
     any product carrying both. Machine 78 hit exactly that: /catalog asked for 'protella'
     while its container asked for 'chocolate-hazelnut'. Rather than guess which screen the
     user will look at, media is written under BOTH keys — see collect().
+
+    media_key wins here too (2026-10-27): two products of one client sharing a taste or an
+    image filename used to land in one folder and the second silently wore the first one's
+    splash (ankara: C4 Original showed the Watermelon BCAA splash). Strapi now sets a unique
+    media_key on such a product, and both the controller and this script must honour it.
     """
+    if p.get("media_key"):
+        return p["media_key"]
     taste = unwrap(p.get("taste"))
     if taste:
         tmain = unwrap(taste.get("main"))
@@ -314,11 +321,18 @@ def collect(lines):
     items, skips = [], []
     seen = set()
     cup_keys = {}   # key -> cup name, to catch two cups claiming one folder
+    by_rel = {}     # rel -> url of the file that won the path
 
     def add(rel, url):
         if rel not in seen:
             seen.add(rel)
+            by_rel[rel] = url
             items.append((rel, url))
+        elif by_rel[rel] != url and not rel.startswith("CompanyLogos/"):
+            # First writer wins, so a second, different picture for the same path never
+            # reaches the machine. Say so instead of dropping it silently.
+            skips.append((rel, f"media key collision — kept {by_rel[rel]}, dropped {url}; "
+                               "set media_key on one of the products"))
 
     for line in lines:
         if line.get("isActive") is False:
@@ -347,6 +361,16 @@ def collect(lines):
             if own_cup and own_cup.get("id") not in seen_cup_ids:
                 seen_cup_ids.add(own_cup.get("id"))
                 cups.append(own_cup)
+        # The cups the line's products are actually served in (planogram: `p.cup or
+        # line.cups[0]`). The line's own custom_splash goes into these — see below.
+        line_cups = list(unwrap(line.get("cups")) or [])
+        used_cup_ids = set()
+        for _p in unwrap(line.get("products")) or []:
+            if _p.get("isActive") is False:
+                continue
+            c = unwrap(_p.get("cup")) or (line_cups[0] if line_cups else None)
+            if c:
+                used_cup_ids.add(c.get("id"))
         if not cups:
             # Not cosmetic: the kiosk draws whatever cup the planogram names, and with no
             # cup on the line that is cupKey(null) = "default". Worth seeing in the report.
@@ -370,7 +394,13 @@ def collect(lines):
                 # several cups it would paint the same splash into every cup folder and erase
                 # the very difference the extra tiles exist to show. With more than one cup
                 # each cup keeps its own default_splash; with one cup nothing changes.
-                line_spl = unwrap(line.get("custom_splash")) if len(cups) == 1 else None
+                # 2026-10-27: that dropped the client's choice whenever a line merely LISTED a
+                # second, unused cup (inherited from the template) — ankara's Pre Training
+                # showed the cup's "Color Creamy" instead of the line's "Color red". The line
+                # splash now goes into every cup a product of this line is served in; cups
+                # nobody is served in keep their own default_splash.
+                line_spl = (unwrap(line.get("custom_splash"))
+                            if len(cups) == 1 or cup.get("id") in used_cup_ids else None)
                 line_spl_imgs = unwrap(line_spl.get("images")) if line_spl else None
                 ds = unwrap(cup.get("default_splash"))
                 splash_imgs = line_spl_imgs or (unwrap(ds.get("images")) if ds else None) or []
