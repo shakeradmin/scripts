@@ -57,6 +57,13 @@ MACHINE_NICKNAME="${MACHINE_NICKNAME:-}"
 UNITY_VERSION="${UNITY_VERSION:-}"
 SSD_VERSION="${SSD_VERSION:-}"
 BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+# Fleet automation opt-ins written into the new Strapi machine record. Both ON by default since
+# 2026-10-26 (owner's call: every new machine takes stable app patches via fleetpatch and
+# stable controller firmware via fleetfirmware without a hand edit in the admin panel). Set
+# MACHINE_AUTOUPDATE=false / MACHINE_FIRMWARE_AUTOFLASH=false in .env to register one opted out
+# (e.g. the Touch 260100xx batch whose bootloader never answers the flasher).
+MACHINE_AUTOUPDATE="${MACHINE_AUTOUPDATE:-true}"
+MACHINE_FIRMWARE_AUTOFLASH="${MACHINE_FIRMWARE_AUTOFLASH:-true}"
 # Bring the kiosk back up at the very end, the way run.sh does. Set to anything but "true" to
 # leave the machine at the desktop instead (useful when more work follows the bootstrap run).
 START_APP_AFTER_BOOTSTRAP="${START_APP_AFTER_BOOTSTRAP:-true}"
@@ -355,6 +362,8 @@ load_env() {
   UNITY_VERSION="${UNITY_VERSION:-}"
   SSD_VERSION="${SSD_VERSION:-}"
   BOOTSTRAP_VERSION="${BOOTSTRAP_VERSION:-0.1.0}"
+  MACHINE_AUTOUPDATE="${MACHINE_AUTOUPDATE:-true}"
+  MACHINE_FIRMWARE_AUTOFLASH="${MACHINE_FIRMWARE_AUTOFLASH:-true}"
   START_APP_AFTER_BOOTSTRAP="${START_APP_AFTER_BOOTSTRAP:-true}"
   MANAGE_API_BASE="${MANAGE_API_BASE:-https://manage.ishakerusa.com}"
   # MUST be re-defaulted here, not only at the top of the script: the top-level assignment
@@ -1585,6 +1594,8 @@ json_payload() {
   SSD_VERSION_VALUE="$SSD_VERSION" \
   ADMIN_COMMENT_VALUE="${ADMIN_COMMENT:-}" \
   MACHINE_STATUS_VALUE="${MACHINE_STATUS:-new}" \
+  MACHINE_AUTOUPDATE_VALUE="${MACHINE_AUTOUPDATE:-true}" \
+  MACHINE_FIRMWARE_AUTOFLASH_VALUE="${MACHINE_FIRMWARE_AUTOFLASH:-true}" \
   python3 - <<'PY'
 import json
 import os
@@ -1592,6 +1603,15 @@ import os
 
 def env_or_none(key):
     return os.environ.get(key) or None
+
+
+def env_flag(key, default=True):
+    value = (os.environ.get(key) or "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 data = {
@@ -1614,6 +1634,10 @@ data = {
     "machine_key": env_or_none("MACHINE_KEY_VALUE"),
     "rustdesk_password": env_or_none("RUSTDESK_PASSWORD_VALUE"),
     "secret": os.environ["MACHINE_SECRET_VALUE"],
+    # fleetpatch (stable app patches) and fleetfirmware (stable controller images) opt-ins,
+    # on by default — see MACHINE_AUTOUPDATE / MACHINE_FIRMWARE_AUTOFLASH at the top.
+    "isAutoupdate": env_flag("MACHINE_AUTOUPDATE_VALUE"),
+    "isFirmwareAutoflash": env_flag("MACHINE_FIRMWARE_AUTOFLASH_VALUE"),
 }
 
 print(json.dumps({"data": data}))
