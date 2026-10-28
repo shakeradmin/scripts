@@ -182,7 +182,10 @@ def managed_fingerprint_remote(target):
     whose reference set is byte-identical; a mismatch means types could resolve to a
     different assembly and the app dies with TypeLoadException at runtime, not at build.
     """
-    cmd = ("find %s/Managed -name '*.dll' ! -name 'CommonCode.dll' ! -name '._*' "
+    # The collation is part of the fingerprint: every sidecar was computed with sort under
+    # en_US.UTF-8 (forwarded by the ishaker PC's ssh). From the VPS ssh forwards C.UTF-8 and
+    # the same Managed/ hashes differently (spain 66b5cd3f vs e992f0dd, 2026-10-28), so pin it.
+    cmd = ("export LC_ALL=en_US.UTF-8; find %s/Managed -name '*.dll' ! -name 'CommonCode.dll' ! -name '._*' "
            "-exec md5sum {} \\; | sort -k2 | awk '{print $1}' | md5sum | cut -d' ' -f1" % SV_DIR)
     rc, out = ssh(target, cmd)
     return out.strip() if rc == 0 else None
