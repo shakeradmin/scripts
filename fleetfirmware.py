@@ -82,6 +82,9 @@ import urllib.request
 
 HOME = os.path.expanduser("~")
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+_spec_fm = importlib.util.spec_from_file_location("fleet_manual", os.path.join(SCRIPTS, "fleet_manual.py"))
+fleet_manual = importlib.util.module_from_spec(_spec_fm)
+_spec_fm.loader.exec_module(fleet_manual)
 LOG_ROOT = os.path.join(HOME, "fleetfirmware")
 CACHE = os.path.join(LOG_ROOT, "images")
 STRAPI = os.environ.get("STRAPI_BASE_URL", "http://localhost:1338")
@@ -241,7 +244,8 @@ def machines(token, only=None):
         if only and m["id"] != only:
             continue
         out.append(m)
-    return out
+    return fleet_manual.filter_rows(out, get_serial=lambda r: r.get("serial_number"),
+                                    get_ip=lambda r: r.get("tailscale_ip"), log=log)
 
 
 def pick_firmware(firmwares, machine, p=None):

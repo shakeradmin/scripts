@@ -93,6 +93,10 @@ _spec = importlib.util.spec_from_file_location(
     "lpm", os.path.join(SCRIPTS, "load_product_media.py"))
 lpm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lpm)
+# Manual-support machines (fleet_manual.txt) never enter a sweep set — any pass.
+_spec_fm = importlib.util.spec_from_file_location("fleet_manual", os.path.join(SCRIPTS, "fleet_manual.py"))
+fleet_manual = importlib.util.module_from_spec(_spec_fm)
+_spec_fm.loader.exec_module(fleet_manual)
 
 
 def now_iso():
@@ -132,7 +136,7 @@ def select_machines(token, patched_only=True):
                     "user": a.get("ssh_user") or "shaker",
                     "patch_id": patch.get("id"),
                     "prev": a.get("fleet_status") or {}})
-    return out
+    return fleet_manual.filter_rows(out, get_nick=lambda r: r.get("name"), log=print)
 
 
 # These three describe the MACHINE, not this sweep, so an unreachable pass must not erase
@@ -931,6 +935,12 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
     if not target:
         status.update(ssh_ok=False, sweep="no tailscale_ip", online=False, online_source=None)
         return status, ["no tailscale_ip in machine record"]
+    # A node the tailnet reports as offline cannot answer SSH either; waiting out the SSH
+    # timeout for each of them (~25 powered-off boxes x 8-20 s) was a third of the sweep
+    # and kept live machines' status ~20 min old (2026-10-20). Unknown IP = still try SSH.
+    if tailnet_online().get(m["ip"]) is False:
+        status.update(ssh_ok=False, sweep="unreachable", online=False, online_source="tailnet")
+        return status, ["unreachable (offline on the tailnet, ssh skipped)"]
     try:
         status.update(heartbeat(target))
     except subprocess.TimeoutExpired:

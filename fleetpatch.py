@@ -71,6 +71,9 @@ import urllib.request
 
 HOME = os.path.expanduser("~")
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+_spec_fm = importlib.util.spec_from_file_location("fleet_manual", os.path.join(SCRIPTS, "fleet_manual.py"))
+fleet_manual = importlib.util.module_from_spec(_spec_fm)
+_spec_fm.loader.exec_module(fleet_manual)
 ARTIFACT_ROOT = os.path.join(HOME, "fleetpatch", "artifacts")
 LOG_ROOT = os.path.join(HOME, "fleetpatch")
 STRAPI = os.environ.get("STRAPI_BASE_URL", "http://localhost:1338")
@@ -224,7 +227,7 @@ def candidate_machines(token):
             "patch_id": ((a.get("patch") or {}).get("data") or {}).get("id"),
             "type_id": ((a.get("machine_type") or {}).get("data") or {}).get("id"),
         })
-    return out
+    return fleet_manual.filter_rows(out, log=log)
 
 
 def read_sidecar(path):

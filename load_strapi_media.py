@@ -136,6 +136,27 @@ def frame_num(name):
     return f"{int(m.group(1)):02d}" if m else None
 
 
+def fill_splash_gaps(items):
+    """Add a copy of the nearest frame for every missing number in each *_splash folder.
+
+    ShakerView plays frames 01..NN by number and draws a missing one as an empty white
+    splash. Nearest existing frame wins, the later one on a tie (_06 missing -> _07).
+    Same rule as splash_frames() in load_product_media.py.
+    """
+    folders = {}
+    for rel, url in items:
+        m = re.match(r"^(.*_splash/.*_)(\d+)\.png$", rel)
+        if m:
+            folders.setdefault(m.group(1), {})[int(m.group(2))] = url
+    for prefix, by_num in folders.items():
+        have = sorted(by_num)
+        for n in range(1, have[-1] + 1):
+            if n not in by_num:
+                src = min(have, key=lambda h: (abs(h - n), -h))
+                items.append((f"{prefix}{n:02d}.png", by_num[src]))
+    return items
+
+
 def clean_stem(name):
     return re.sub(r"\.png$", "", name, flags=re.I).strip()
 
@@ -221,7 +242,7 @@ def target_paths(collection, entry):
                 continue
             items.append((f"Cups/{key}/{key}_splash/{key}_splash_{nn}.png", m["url"]))
 
-    return items, skips
+    return fill_splash_gaps(items), skips
 
 
 def download(url, dest, resume=True):

@@ -114,6 +114,30 @@ def frame_num(name, fallback_idx):
     return f"{int(m.group(1)):02d}" if m else f"{fallback_idx:02d}"
 
 
+def splash_frames(imgs):
+    """[(NN, url)] for a splash animation, with holes in the numbering filled.
+
+    ShakerView plays <key>_splash_01..NN by number, and a number with no file renders as
+    an empty white frame in the middle of the pour. Many Strapi splashes lack a frame or
+    several (37 of 178 on 2026-09-25, e.g. "Strawberry Ice Cream" has no _06 — the batch
+    that built them skipped wrong-sized source frames). Each missing number from 01 up to
+    the highest present gets a copy of the nearest existing frame; on a tie the later one,
+    so _06 becomes a copy of _07. Re-uploading clones to Strapi instead is not an option:
+    its sizeOptimization re-encode damages alpha PNGs (see splash-entity-offload notes).
+    """
+    by_num = {}
+    for i, f in enumerate(imgs or [], 1):
+        by_num.setdefault(int(frame_num(f["name"], i)), f["url"])
+    if not by_num:
+        return []
+    have = sorted(by_num)
+    out = []
+    for n in range(1, have[-1] + 1):
+        src = n if n in by_num else min(have, key=lambda h: (abs(h - n), -h))
+        out.append((f"{n:02d}", by_num[src]))
+    return out
+
+
 def product_key(p):
     if p.get("media_key"):
         return p["media_key"]
@@ -260,7 +284,13 @@ def lines_from_cells(token, products):
         want.setdefault(line["id"], set()).add(p["id"])
     lines = []
     for lid, pids in want.items():
-        full = api(f"/api/product-lines/{lid}?{LINE_POPULATE}", token)["data"]
+        # Ask Strapi for just this machine's products. Line 9 ('Whey Protein') has 400+
+        # products: the unfiltered deep populate was 18 MB / ~40 s per machine and stalled
+        # the whole Strapi process during every FleetPulse sweep (2026-10-20). The trim
+        # below stays as a guard in case a populate filter is ever ignored.
+        only = "".join(f"&populate[products][filters][id][$in][{i}]={pid}"
+                       for i, pid in enumerate(sorted(pids)))
+        full = api(f"/api/product-lines/{lid}?{LINE_POPULATE}{only}", token)["data"]
         attrs = dict(full["attributes"])
         prods = (attrs.get("products") or {}).get("data") or []
         # Keep Strapi's {'data': [...]} shape — unwrap() in collect() expects the raw entries.
@@ -404,8 +434,8 @@ def collect(lines):
                 line_spl_imgs = unwrap(line_spl.get("images")) if line_spl else None
                 ds = unwrap(cup.get("default_splash"))
                 splash_imgs = line_spl_imgs or (unwrap(ds.get("images")) if ds else None) or []
-                for i, f in enumerate(splash_imgs, 1):
-                    add(f"Cups/{ck}/{ck}_splash/{ck}_splash_{frame_num(f['name'], i)}.png", f["url"])
+                for nn, url in splash_frames(splash_imgs):
+                    add(f"Cups/{ck}/{ck}_splash/{ck}_splash_{nn}.png", url)
             elif cup:
                 skips.append((f"cup '{cup.get('name')}' (line '{line.get('name')}')",
                               "no clean cup key — image filename is unusable and media_key is unset"))
@@ -440,8 +470,8 @@ def collect(lines):
                     add(f"Tastes/{key}/{key}.png", main["url"])
                 if circ_imgs:
                     add(f"Tastes/{key}/cicle-{key}.png", circ_imgs[0]["url"])
-                for i, f in enumerate(spl_imgs or [], 1):
-                    add(f"Tastes/{key}/{key}_splash/taste-{key}_{frame_num(f['name'], i)}.png", f["url"])
+                for nn, url in splash_frames(spl_imgs):
+                    add(f"Tastes/{key}/{key}_splash/taste-{key}_{nn}.png", url)
     return items, skips
 
 
