@@ -14,10 +14,10 @@ Per machine, per cycle:
   1. heartbeat — one ssh probe: app pid + RSS, patch-diag freshness, telemetry WS
      state, last FleetCatalog md5, disk free. Written to Strapi machine.fleet_status
      (json) so the portal/admin can show live fleet health.
-  2. media    — manifest of the machine's product media (Strapi upload URLs embed a
-     content hash, so URL set == content set). Manifest changed → stage + push via
-     load_product_media.py (tar over ssh), remember restart is needed.
-     First-ever run pushes but does NOT restart (baseline).
+  2. media    — load_product_media.py verifies the machine's files by md5 against what
+     Strapi selects (cell products, their cups/line splashes, tastes, logos) and pushes
+     only what differs; runs on every manifest change and at least every MEDIA_VERIFY_S.
+     Restart only when files were actually replaced.
   3. cells    — NOT handled here. The machine pulls its planogram from Strapi itself
      (/api/machines/<serial>/planogram, 5 min). Pushing cells from here too would put
      two writers on config.json. Left in the status line as a marker only.
@@ -86,6 +86,9 @@ DIAG_FRESH_S = 300
 # ~20 s AppManager needs to bring the process back after our own kill.
 STARTUP_GRACE_S = 120
 APP_RECHECK_S = 20
+# Media is checked against the machine itself at least this often, even when Strapi did
+# not change — see step 2 in sweep_one().
+MEDIA_VERIFY_S = int(os.environ.get("FLEETPULSE_MEDIA_VERIFY_S", "1800"))
 
 # Reuse load_product_media's Strapi helpers + media collection (same key derivation
 # as the catalog controller). Import by path: the script has a __main__ guard.
@@ -1049,26 +1052,48 @@ def sweep_machine(m, token, dry_run=False, verbose=False):
 
     restart_needed = False
 
-    # 2) media
+    # 2) media — the MACHINE is the reference, not our manifest.
+    # Until 2026-10-31 a push happened only when the Strapi-side manifest changed. Anything
+    # that slipped past one push (a run before a script fix, an inactive line, a crash
+    # mid-sweep) then stayed wrong forever while the manifest said "unchanged": ankara showed
+    # 12.10 cup splashes for 19 days. Now load_product_media verifies md5s ON the machine and
+    # sends only what differs — on every manifest change and at least every MEDIA_VERIFY_S.
     manifest_file = os.path.join(mdir, "media_manifest.md5")
+    verified_file = os.path.join(mdir, "media_verified_at")
     try:
         digest, items = media_manifest(token, m["id"])
         prev = open(manifest_file).read().strip() if os.path.exists(manifest_file) else None
+        try:
+            last_ok = float(open(verified_file).read().strip())
+        except Exception:
+            last_ok = 0.0
+        due = digest != prev or time.time() - last_ok >= MEDIA_VERIFY_S
         status["media"] = {"files": len(items), "changed": digest != prev}
-        if digest != prev and not dry_run:
+        if due and not dry_run:
             r = subprocess.run(
                 [sys.executable, os.path.join(SCRIPTS, "load_product_media.py"),
                  "--machine", str(m["id"]),
                  "--stage", os.path.join(mdir, "media-stage"), "--push", "auto"],
-                capture_output=True, text=True, timeout=600)
-            if r.returncode == 0:
+                capture_output=True, text=True, timeout=900)
+            sync = None
+            for ln in r.stdout.splitlines():
+                if ln.startswith("SYNC "):
+                    try:
+                        sync = json.loads(ln[5:])
+                    except ValueError:
+                        pass
+            if r.returncode == 0 and sync is not None:
                 open(manifest_file, "w").write(digest)
-                restart_needed = prev is not None  # first run = baseline, no restart
-                notes.append(f"media pushed ({len(items)} files)"
-                             + ("" if prev else " [baseline, no restart]"))
+                open(verified_file, "w").write(str(time.time()))
+                status["media"].update(verified_at=datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                       pushed=sync["changed"], deleted=sync["deleted"])
+                if sync["changed"] or sync["deleted"]:
+                    restart_needed = True
+                    notes.append(f"media synced: {sync['changed']} file(s) replaced, "
+                                 f"{sync['deleted']} stale frame(s) removed")
             else:
                 status["media"]["error"] = (r.stdout + r.stderr)[-300:]
-                notes.append("ERROR: media push failed")
+                notes.append("ERROR: media sync failed")
     except Exception as e:
         status["media"] = {"error": str(e)[:200]}
         notes.append(f"ERROR: media manifest: {e}")

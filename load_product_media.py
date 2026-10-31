@@ -32,9 +32,11 @@ USAGE
 ENV: STRAPI_BASE_URL (default https://admin.ishaker.xyz; use http://localhost:1338 on the
      Strapi box), creds from ~/Desktop/credentials/.env. NOTE: this Strapi instance only
      accepts the USERNAME identifier form — STRAPI_MACHINE_USER_USERNAME is preferred.
-Push overwrites files & creates dirs; never deletes extras.
+Push is VERIFIED: md5 of every target file on the machine is compared with Strapi's
+selection, only differing/missing files are sent, frames left over in *_splash folders
+are removed, and the result is re-checked. Prints one line `SYNC {...}` for FleetPulse.
 """
-import argparse, json, os, re, shutil, subprocess, sys, urllib.parse, urllib.request
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STRAPI = os.environ.get("STRAPI_BASE_URL", "https://admin.ishaker.xyz")
@@ -295,7 +297,9 @@ def lines_from_cells(token, products):
         prods = (attrs.get("products") or {}).get("data") or []
         # Keep Strapi's {'data': [...]} shape — unwrap() in collect() expects the raw entries.
         attrs["products"] = {"data": [e for e in prods if e["id"] in pids]}
-        lines.append(dict(attrs, id=full["id"]))
+        # _from_cells: these products sit in the machine's cells, so the planogram SELLS
+        # them whatever isActive says. Their art must follow (see live()).
+        lines.append(dict(attrs, id=full["id"], _from_cells=True))
     return lines
 
 
@@ -364,8 +368,15 @@ def collect(lines):
             skips.append((rel, f"media key collision — kept {by_rel[rel]}, dropped {url}; "
                                "set media_key on one of the products"))
 
+    def live(x, line):
+        # isActive only scopes the legacy "all lines of the client" fallback. A product that
+        # is in a cell is on the screen no matter what the toggle says: on 2026-10-27 ankara's
+        # BCAA line was switched off in the portal, the cell kept selling it, and the line's
+        # new splash was never delivered — the tile kept a picture nobody had chosen.
+        return line.get("_from_cells") or x.get("isActive") is not False
+
     for line in lines:
-        if line.get("isActive") is False:
+        if not live(line, line):
             continue
         # Every brand on the line, not just brands[0]: a line can stock several, and the
         # kiosk asks for whichever one the served product belongs to.
@@ -385,7 +396,7 @@ def collect(lines):
         # cups[0] — what an unpatched machine shows — keeps its place.
         seen_cup_ids = set(c.get("id") for c in cups if c)
         for _p in unwrap(line.get("products")) or []:
-            if _p.get("isActive") is False:
+            if not live(_p, line):
                 continue
             own_cup = unwrap(_p.get("cup"))
             if own_cup and own_cup.get("id") not in seen_cup_ids:
@@ -396,7 +407,7 @@ def collect(lines):
         line_cups = list(unwrap(line.get("cups")) or [])
         used_cup_ids = set()
         for _p in unwrap(line.get("products")) or []:
-            if _p.get("isActive") is False:
+            if not live(_p, line):
                 continue
             c = unwrap(_p.get("cup")) or (line_cups[0] if line_cups else None)
             if c:
@@ -441,7 +452,7 @@ def collect(lines):
                               "no clean cup key — image filename is unusable and media_key is unset"))
 
         for p in unwrap(line.get("products")) or []:
-            if p.get("isActive") is False:
+            if not live(p, line):
                 continue
             # /catalog keys an ingredient by product_key, the container keys its Taste by
             # taste_media_key, and the two differ whenever a product has both custom_main
@@ -485,6 +496,124 @@ def download(url, dest):
     os.replace(tmp, dest)
 
 
+def stage_items(items, stage, workers=16):
+    """Download items into <stage>/Media, re-using files whose source URL is unchanged.
+
+    Strapi upload URLs embed a hash, so a (rel -> url) match means the bytes are the same and
+    the file need not be fetched again. That keeps a verify pass on every FleetPulse sweep
+    cheap for Strapi (the old code re-downloaded all ~200 files on every change).
+    """
+    cache_f = os.path.join(stage, ".urlcache.json")
+    try:
+        cache = json.load(open(cache_f))
+    except Exception:
+        cache = {}
+    todo = [(rel, url) for rel, url in items
+            if cache.get(rel) != url or not os.path.isfile(os.path.join(stage, "Media", rel))]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(download, url, os.path.join(stage, "Media", rel)): (rel, url)
+                for rel, url in todo}
+        for fut in as_completed(futs):
+            fut.result()
+            rel, url = futs[fut]
+            cache[rel] = url
+    tmp = cache_f + ".part"
+    json.dump(cache, open(tmp, "w"))
+    os.replace(tmp, cache_f)
+    return len(todo)
+
+
+def md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def owned_splash_dirs(items):
+    """Splash folders this script fully owns: every frame in them comes from Strapi.
+
+    A frame left over from an older, longer animation would keep playing after the new
+    one (ShakerView plays _01.._NN by number), so these folders are pruned to exactly the
+    expected set. Nothing outside *_splash folders is ever deleted.
+    """
+    return sorted({os.path.dirname(rel) for rel, _ in items
+                   if re.search(r"_splash/[^/]+\.png$", rel)})
+
+
+# Runs on the kiosk (python3 is always there) with cwd = Media/; request on stdin.
+REMOTE_SCAN = """
+import hashlib, json, os, sys
+dirs = json.loads(sys.stdin.readline()); rels = json.loads(sys.stdin.readline())
+out = {"md5": {}, "listing": {}}
+for r in rels:
+    try:
+        out["md5"][r] = hashlib.md5(open(r, "rb").read()).hexdigest()
+    except OSError:
+        pass
+for d in dirs:
+    try:
+        out["listing"][d] = sorted(f for f in os.listdir(d) if f.endswith(".png"))
+    except OSError:
+        out["listing"][d] = []
+print(json.dumps(out))
+"""
+
+
+def remote_scan(target, password, remote_media, rels, dirs):
+    """{rel: md5} for files present on the machine + {dir: [png names]} for owned dirs."""
+    payload = json.dumps(dirs) + "\n" + json.dumps(rels) + "\n"
+    cmd = ssh_cmd(target, password, "cd " + shell_quote(remote_media)
+                  + " && python3 -c " + shell_quote(REMOTE_SCAN))
+    r = subprocess.run(cmd, input=payload, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"remote scan failed rc={r.returncode}: {(r.stderr or r.stdout)[-300:]}")
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def verified_push(target, password, stage, items, remote_media):
+    """Make the machine's files byte-identical to what Strapi selects. -> dict summary.
+
+    The machine, not a local manifest, is the reference: on 2026-10-31 ankara still showed
+    the 2026-10-12 cup splashes (Caramel / Creamy / Apple) while Strapi had Color brown /
+    red / hot pink, and the manifest said "unchanged". Comparing md5s on the machine finds
+    every such drift, whatever caused it, and pushes only what differs.
+    """
+    want = {rel: md5_file(os.path.join(stage, "Media", rel)) for rel, _ in items}
+    dirs = owned_splash_dirs(items)
+    scan = remote_scan(target, password, remote_media, sorted(want), dirs)
+    have = scan["md5"]
+    diff = sorted(r for r, m in want.items() if have.get(r) != m)
+    extras = []
+    for d in dirs:
+        expected = {os.path.basename(r) for r in want if os.path.dirname(r) == d}
+        extras += [f"{d}/{f}" for f in scan["listing"].get(d, []) if f not in expected]
+    if diff:
+        lst = os.path.join(stage, ".push-list")
+        with open(lst, "w") as fh:
+            fh.write("".join(f"Media/{r}\n" for r in diff))
+        remote_parent = os.path.dirname(remote_media.rstrip("/"))
+        tar = subprocess.Popen(["tar", "-C", stage, "-cf", "-", "-T", lst], stdout=subprocess.PIPE)
+        rc = subprocess.run(ssh_cmd(target, password,
+                                    f"tar -C {shell_quote(remote_parent)} --overwrite -xf -"),
+                            stdin=tar.stdout).returncode
+        tar.stdout.close()
+        tar.wait()
+        if rc != 0 or tar.returncode != 0:
+            raise RuntimeError(f"push failed (ssh/tar rc={rc}, local tar rc={tar.returncode})")
+    if extras:
+        rm = "cd " + shell_quote(remote_media) + " && rm -f -- " + " ".join(shell_quote(e) for e in extras)
+        subprocess.run(ssh_cmd(target, password, rm), check=True, timeout=60)
+    bad = []
+    if diff:
+        after = remote_scan(target, password, remote_media, diff, [])["md5"]
+        bad = [r for r in diff if after.get(r) != want[r]]
+    return {"files": len(want), "changed": len(diff), "deleted": len(extras),
+            "bad": len(bad), "changed_paths": diff[:50], "deleted_paths": extras[:50],
+            "bad_paths": bad[:20]}
+
+
 def ssh_cmd(target, password, remote_command):
     cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
     if password:
@@ -506,6 +635,7 @@ def main():
     ap.add_argument("--restart", action="store_true",
                     help="restart ShakerView after push (single-PID kill; AppManager relaunches)")
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--verbose", action="store_true", help="list every staged file")
     ap.add_argument("--remote-media", default=SV_MEDIA)
     args = ap.parse_args()
 
@@ -529,12 +659,11 @@ def main():
 
     stage = os.path.abspath(args.stage)
     os.makedirs(os.path.join(stage, "Media"), exist_ok=True)
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = [pool.submit(download, url, os.path.join(stage, "Media", rel)) for rel, url in items]
-        for fut in as_completed(futs):
-            fut.result()
-    for rel, _ in sorted(items):
-        print("  ", rel)
+    fetched = stage_items(items, stage, args.workers)
+    print(f"staged ({fetched} downloaded, {len(items) - fetched} unchanged from cache)")
+    if args.verbose:
+        for rel, _ in sorted(items):
+            print("  ", rel)
 
     if skips:
         report = os.path.join(stage, "SKIPPED.txt")
@@ -557,18 +686,18 @@ def main():
             sys.exit("machine record has no tailscale_ip; pass --push user@ip explicitly")
         target = f"{user}@{ip}"
 
-    remote_parent = os.path.dirname(args.remote_media.rstrip("/"))
-    print(f"\nPushing to {target}:{args.remote_media} (overwrite in place)…")
-    tar = subprocess.Popen(["tar", "-C", stage, "-cf", "-", "Media"], stdout=subprocess.PIPE)
-    rc = subprocess.run(ssh_cmd(target, args.password, f"tar -C {shell_quote(remote_parent)} -xf -"),
-                        stdin=tar.stdout).returncode
-    tar.stdout.close()
-    tar.wait()
-    if rc != 0:
-        sys.exit(f"Push failed (ssh/tar rc={rc})")
-    print("Push complete.")
+    print(f"\nVerifying {target}:{args.remote_media} against Strapi…")
+    res = verified_push(target, args.password, stage, items, args.remote_media)
+    for r in res["changed_paths"]:
+        print("   pushed ", r)
+    for r in res["deleted_paths"]:
+        print("   deleted", r)
+    # One parseable line for FleetPulse.
+    print("SYNC " + json.dumps({k: res[k] for k in ("files", "changed", "deleted", "bad")}))
+    if res["bad"]:
+        sys.exit(f"{res['bad']} file(s) still differ after push: {res['bad_paths']}")
 
-    if args.restart:
+    if args.restart and (res["changed"] or res["deleted"]):
         # Canonical restart: kill the specific ShakerView PID; AppManager relaunches in ~15 s.
         # NEVER pattern-kill (team rule) — identify by comm, not pgrep -f.
         rcmd = ("PID=$(ps -eo pid,comm | awk '$2 ~ /^ShakerView2.0/ {print $1}'); "
